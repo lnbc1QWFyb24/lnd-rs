@@ -1,0 +1,11 @@
+
+**/target
+**/CLAUDE.md
+.env
+.data
+.DS_Store
+
+
+# Added by cargo
+
+/target

@@ -1,0 +1,94 @@
+[package]
+name = "lnd-rs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust crate for connecting to LND over direct gRPC or Lightning Node Connect (LNC) transports"
+repository = ""
+
+[lib]
+name = "lnd_rs"
+path = "src/lib.rs"
+
+[features]
+default = ["transport-direct"]
+transport-direct = []
+transport-mailbox = [
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
+    "dep:url",
+    "dep:scrypt",
+    "dep:hmac",
+    "dep:k256",
+    "dep:chacha20poly1305",
+    "dep:hkdf",
+    "dep:parking_lot",
+]
+dangerous-insecure-tls = []
+
+[dependencies]
+tonic = { version = "0.12", features = ["tls", "tls-roots"] }
+prost = "0.13"
+prost-types = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "net", "sync"] }
+tower = "0.5"
+hyper = { version = "1", features = ["client", "http2"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+hyper-rustls = { version = "0.27", features = ["http2"] }
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+hex = "0.4"
+rand = "0.8"
+sha2 = "0.10"
+base64 = "0.22"
+async-trait = "0.1"
+tracing = "0.1"
+
+# Optional deps for mailbox transport (only pulled when feature enabled)
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"], optional = true }
+futures-util = { version = "0.3", optional = true }
+url = { version = "2", optional = true }
+scrypt = { version = "0.11", optional = true }
+hmac = { version = "0.12", optional = true }
+k256 = { version = "0.13", features = ["arithmetic", "ecdh"], optional = true }
+chacha20poly1305 = { version = "0.10", optional = true }
+hkdf = { version = "0.12", optional = true }
+hyper-util = { version = "0.1", features = ["client", "http2", "tokio"] }
+parking_lot = { version = "0.12", optional = true }
+
+# Optional credential encryption, currently unused by default
+# aes-gcm/pbkdf2/zeroize removed for now to avoid fetching new crates offline
+
+[build-dependencies]
+tonic-build = { version = "0.12", features = ["prost"] }
+prost-build = "0.13"
+walkdir = "2"
+
+[dev-dependencies]
+tokio-stream = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+proptest = "1"
+
+[[example]]
+name = "derive_sid"
+path = "examples/derive_sid.rs"
+required-features = ["transport-mailbox"]
+
+[[example]]
+name = "getinfo"
+path = "examples/getinfo.rs"
+required-features = ["transport-direct"]
+
+[[example]]
+name = "pair_save"
+path = "examples/pair_save.rs"
+required-features = ["transport-mailbox"]
+
+[[example]]
+name = "connect_saved"
+path = "examples/connect_saved.rs"
+required-features = ["transport-mailbox"]
