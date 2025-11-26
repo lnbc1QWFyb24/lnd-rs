@@ -644,24 +644,60 @@ impl GoBackNConn {
                 continue;
             }
             if inner.pending_ping_expired().await {
+                debug!(target: "lnd_rs::gbn", "keepalive ping expired; closing connection");
                 let _ = inner.recv_tx.send(RecvEvent::Fin).await;
                 inner.set_closed();
                 break;
             }
-            if inner.time_since_remote().await
-                > Duration::from_millis(inner.opts.keepalive_ping_ms + inner.opts.pong_timeout_ms)
-            {
+            let idle = inner.time_since_remote().await;
+            let idle_budget =
+                Duration::from_millis(inner.opts.keepalive_ping_ms + inner.opts.pong_timeout_ms);
+            if idle > idle_budget {
+                debug!(
+                    target: "lnd_rs::gbn",
+                    idle_ms = idle.as_millis(),
+                    budget_ms = idle_budget.as_millis(),
+                    "keepalive idle budget exceeded; closing connection"
+                );
                 let _ = inner.recv_tx.send(RecvEvent::Fin).await;
                 inner.set_closed();
                 break;
+            }
+            if !inner.has_send_window_capacity().await {
+                trace!(
+                    target: "lnd_rs::gbn",
+                    "skipping keepalive ping; send window is full"
+                );
+                continue;
             }
             let need_ping = {
                 let ping = inner.pending_ping.lock().await;
                 ping.is_none()
             };
             if need_ping {
-                if let Ok(seq) = inner.send_data(Bytes::new(), true, true).await {
-                    inner.register_ping(seq).await;
+                let send_ping = inner.send_data(Bytes::new(), true, true);
+                let budget = Duration::from_millis(inner.opts.pong_timeout_ms);
+                match time::timeout(budget, send_ping).await {
+                    Ok(Ok(seq)) => inner.register_ping(seq).await,
+                    Ok(Err(err)) => {
+                        debug!(
+                            target: "lnd_rs::gbn",
+                            error = %err,
+                            "keepalive ping send failed; closing connection"
+                        );
+                        let _ = inner.recv_tx.send(RecvEvent::Fin).await;
+                        inner.set_closed();
+                        break;
+                    }
+                    Err(_) => {
+                        debug!(
+                            target: "lnd_rs::gbn",
+                            "keepalive ping send stalled; closing connection"
+                        );
+                        let _ = inner.recv_tx.send(RecvEvent::Fin).await;
+                        inner.set_closed();
+                        break;
+                    }
                 }
             }
         }
@@ -833,6 +869,11 @@ impl Inner {
             Ok(())
         }
     }
+
+    async fn has_send_window_capacity(&self) -> bool {
+        let send = self.send_state.lock().await;
+        send.inflight.len() < self.opts.window_size as usize
+    }
 }
 
 impl Drop for GoBackNConn {
@@ -847,7 +888,7 @@ impl Drop for GoBackNConn {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use tokio::sync::mpsc;
+    use tokio::{sync::mpsc, time};
 
     #[test]
     fn frame_roundtrip_syn() {
@@ -1010,5 +1051,61 @@ mod tests {
         let recv = conn.recv().await.expect("recv");
         assert_eq!(recv, Bytes::from_static(b"pong"));
         conn.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn keepalive_closes_when_window_full_and_remote_silent() {
+        let (client_to_server_tx, mut client_to_server_rx) = mpsc::channel::<Vec<u8>>(32);
+        let (server_to_client_tx, server_to_client_rx) = mpsc::channel::<Vec<u8>>(32);
+
+        tokio::spawn(async move {
+            let mut first_ack_sent = false;
+            while let Some(raw) = client_to_server_rx.recv().await {
+                let frame = Frame::decode(&raw).expect("decode frame");
+                match frame {
+                    Frame::Syn { window } => {
+                        let _ = server_to_client_tx
+                            .send(Frame::Syn { window }.encode())
+                            .await;
+                    }
+                    Frame::Data { seq, .. } if !first_ack_sent => {
+                        let _ = server_to_client_tx.send(Frame::Ack { seq }.encode()).await;
+                        first_ack_sent = true;
+                    }
+                    Frame::Fin => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let opts = GoBackNOptions {
+            window_size: 2,
+            keepalive_ping_ms: 50,
+            pong_timeout_ms: 50,
+            ..GoBackNOptions::default()
+        };
+
+        let conn = GoBackNConn::connect(opts, client_to_server_tx, server_to_client_rx)
+            .await
+            .expect("connect");
+
+        conn.send_frame(Bytes::from_static(b"one"))
+            .await
+            .expect("send one");
+        time::sleep(Duration::from_millis(10)).await;
+        conn.send_frame(Bytes::from_static(b"two"))
+            .await
+            .expect("send two");
+        conn.send_frame(Bytes::from_static(b"three"))
+            .await
+            .expect("send three");
+
+        let res = time::timeout(Duration::from_millis(500), conn.recv()).await;
+
+        match res {
+            Ok(Err(GoBackNConnError::Closed)) => {}
+            Ok(other) => panic!("expected closed connection, got {other:?}"),
+            Err(err) => panic!("keepalive did not close stalled connection: {err}"),
+        }
     }
 }
