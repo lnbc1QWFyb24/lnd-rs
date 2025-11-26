@@ -113,6 +113,29 @@ impl<T: Transport> Lnc<T> {
         }
     }
 
+    /// Construct an [`Lnc`] instance pre-configured with stored pairing credentials.
+    ///
+    /// Use this when reconnecting with credentials saved from a previous
+    /// [`pair_node`](Self::pair_node) call. After construction, call [`connect`](Self::connect)
+    /// to establish the session.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let creds: PairingCredentials = serde_json::from_slice(&data)?;
+    /// let transport = MailboxTransport::new(Some(creds.server_host.clone()));
+    /// let mut lnc = Lnc::from_credentials(transport, creds);
+    /// lnc.connect().await?;
+    /// ```
+    pub fn from_credentials(transport: T, creds: PairingCredentials) -> Self {
+        let mut store = InMemoryCredentialStore::default();
+        store.set_server_host(creds.server_host);
+        store.set_pairing_phrase(creds.pairing_phrase);
+        store.set_local_key(creds.local_key);
+        store.set_remote_key(creds.remote_key);
+        Self::with_store(transport, Box::new(store))
+    }
+
     /// Access the underlying credential store.
     pub fn credentials_store(&self) -> &dyn CredentialStore {
         &*self.creds
@@ -301,6 +324,42 @@ impl<T: Transport> Lnc<T> {
         self.connected = false;
         self.connect().await?;
         self.get_info().await
+    }
+
+    /// Returns the underlying gRPC service for building custom clients.
+    ///
+    /// This is useful when you need clients beyond [`LightningClient`], such as
+    /// `WalletKitClient` or `RouterClient`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use lnd_rs::proto::walletrpc::wallet_kit_client::WalletKitClient;
+    ///
+    /// let svc = lnc.service().await?;
+    /// let mut wallet_kit = WalletKitClient::new(svc);
+    /// ```
+    ///
+    /// # Errors
+    /// Returns [`LncError`] when the transport service cannot be created.
+    pub async fn service(&self) -> Result<LncGrpcService<T>>
+    where
+        T::Svc: tower::Service<
+            http::Request<tonic::body::BoxBody>,
+            Response = http::Response<tonic::body::BoxBody>,
+        >,
+        <T::Svc as tower::Service<http::Request<tonic::body::BoxBody>>>::Error:
+            Into<Box<dyn std::error::Error + Send + Sync>> + Send + Sync,
+    {
+        self.intercepted_service().await
+    }
+
+    /// Returns the transport metadata for manual interceptor setup.
+    ///
+    /// This provides access to the per-request headers (typically the macaroon)
+    /// that the transport captured during connection.
+    pub fn transport_metadata(&self) -> Vec<(String, String)> {
+        self.transport.metadata()
     }
 
     /// Construct an lnrpc.Lightning client bound to the active LNC channel.

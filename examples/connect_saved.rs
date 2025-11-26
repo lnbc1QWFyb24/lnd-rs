@@ -1,10 +1,13 @@
-use lnd_rs::config::DEFAULT_SERVER_HOST;
-use lnd_rs::credentials::{CredentialStore, InMemoryCredentialStore};
 use lnd_rs::transport::mailbox::MailboxTransport;
 use lnd_rs::{Lnc, PairingCredentials};
 use std::env;
 use tokio::fs;
 
+/// Demonstrates reconnecting to an LND node using previously saved credentials.
+///
+/// Usage: cargo run --example connect_saved --features transport-mailbox [creds-path]
+///
+/// The credentials file should be JSON produced by the `pair_save` example.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = env::args()
@@ -13,16 +16,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data = fs::read(&path).await?;
     let creds: PairingCredentials = serde_json::from_slice(&data)?;
 
-    let mut store = InMemoryCredentialStore::default();
-    store.set_server_host(creds.server_host.clone());
-    store.set_pairing_phrase(creds.pairing_phrase.clone());
-    store.set_local_key(creds.local_key.clone());
-    store.set_remote_key(creds.remote_key.clone());
-
-    let mut lnc = Lnc::with_store(
-        MailboxTransport::new(Some(DEFAULT_SERVER_HOST.into())),
-        Box::new(store),
-    );
+    // Use from_credentials() to construct Lnc pre-configured with all pairing
+    // material. This handles populating the credential store internally.
+    let transport = MailboxTransport::new(Some(creds.server_host.clone()));
+    let mut lnc = Lnc::from_credentials(transport, creds);
 
     lnc.connect().await?;
     let info = lnc.get_info_retry().await?;
