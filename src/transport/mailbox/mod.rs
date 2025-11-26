@@ -25,7 +25,7 @@ use async_trait::async_trait;
 #[cfg(feature = "transport-mailbox")]
 use hyper::client::conn::http2 as hyper_http2;
 #[cfg(feature = "transport-mailbox")]
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 #[cfg(feature = "transport-mailbox")]
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use rand::RngCore;
@@ -169,6 +169,7 @@ impl MailboxTransport {
         debug!(target: "lnd_rs::mailbox", "establishing HTTP/2 connection");
         let io = TokioIo::new(noise_conn);
         let mut builder = hyper_http2::Builder::new(TokioExecutor::new());
+        builder.timer(TokioTimer::new());
         let keepalive = &self.config.http2_keepalive;
         builder.keep_alive_interval(keepalive.interval);
         builder.keep_alive_timeout(keepalive.timeout);
