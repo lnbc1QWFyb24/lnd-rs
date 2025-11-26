@@ -72,10 +72,9 @@ impl Default for GoBackNOptions {
             resend_multiplier: 5,
             timeout_update_frequency: 200,
             handshake_timeout_ms: 2000,
-            // Looser keepalive to avoid tearing down long-running idle spans.
-            // Increase interval/timeout further to cushion transient WS stalls.
-            keepalive_ping_ms: 60000,
-            pong_timeout_ms: 45000,
+            // Match the Go client defaults for GBN keepalive behavior.
+            keepalive_ping_ms: 7_000,
+            pong_timeout_ms: 3_000,
             boost_percent: 0.5,
             window_size: 20, // align with Go gbn.DefaultN (20)
             max_chunk_size: 32 * 1024,
@@ -281,16 +280,48 @@ impl Inner {
 
     async fn handle_ack(&self, ack: u8) {
         let mut send = self.send_state.lock().await;
+
+        // If queue is empty, ignore the ACK (matches Go behavior)
+        if send.inflight.is_empty() {
+            trace!(target: "lnd_rs::gbn", ack, "ACK received but queue empty, ignoring");
+            drop(send);
+            return;
+        }
+
+        // Find how many packets to remove from the front of the queue.
+        // The inflight queue is ordered by send time, so we remove from the front
+        // until we find a packet with seq > ack (or the queue is empty).
+        // Since packets are added in sequence order, we can simply check if each
+        // packet's seq matches any seq that would be covered by this ACK.
         let mut to_remove = 0usize;
         let mut rtt_sample = None;
+
+        // ACK for seq N means all packets up to and including N are acknowledged.
+        // Since inflight is ordered by send time (and thus sequence order),
+        // we remove packets from front while their seq <= ack in the queue order.
         for entry in &send.inflight {
-            if seq_lte(entry.seq, ack) {
+            // Remove this entry if its seq matches or precedes the ACK'd seq
+            // We check by position: if this entry is at or before the ACK'd position
+            // in the queue, remove it.
+            if entry.seq == ack {
                 to_remove += 1;
                 rtt_sample = Some(Instant::now().saturating_duration_since(entry.sent_at));
-            } else {
-                break;
+                break; // Found the exact ACK, stop here
             }
+            // This entry's seq is before the ACK'd seq in queue order, so remove it
+            to_remove += 1;
+            rtt_sample = Some(Instant::now().saturating_duration_since(entry.sent_at));
         }
+
+        // If we didn't find the ACK'd seq in our queue, it might be a late/duplicate ACK
+        // for something we already removed. In that case, don't remove anything.
+        let found = send.inflight.iter().take(to_remove).any(|e| e.seq == ack);
+        if !found && to_remove > 0 {
+            trace!(target: "lnd_rs::gbn", ack, "ACK not found in inflight, ignoring");
+            drop(send);
+            return;
+        }
+
         for _ in 0..to_remove {
             if let Some(entry) = send.inflight.pop_front() {
                 if let Frame::Data { is_ping, .. } = entry.frame {
@@ -310,7 +341,8 @@ impl Inner {
         }
         let mut ping = self.pending_ping.lock().await;
         if let Some(p) = ping.as_ref() {
-            if seq_lte(p.seq, ack) {
+            // Check if ping seq is covered by this ACK
+            if p.seq == ack {
                 *ping = None;
                 debug!(target: "lnd_rs::gbn", ack_seq = ack, "keepalive ping acked");
             }
@@ -338,10 +370,16 @@ impl Inner {
         is_ping: bool,
         payload: Bytes,
     ) -> Option<RecvEvent> {
+        // Sequence space size: s = n + 1 (matches Go's cfg.s)
+        let s = self.opts.window_size + 1;
+
         let mut recv = self.recv_state.lock().await;
         let expected = recv.expected_seq;
+
         if seq == expected {
-            recv.expected_seq = recv.expected_seq.wrapping_add(1);
+            // Got the expected sequence - accept it and advance
+            // Use modular arithmetic: (expected + 1) % s
+            recv.expected_seq = (expected + 1) % s;
             drop(recv);
             let _ = self.send_raw(Frame::Ack { seq }).await;
             if is_ping {
@@ -352,12 +390,12 @@ impl Inner {
                 final_chunk,
             }));
         }
-        if seq_lte(seq, expected.wrapping_sub(1)) {
-            drop(recv);
-            let _ = self.send_raw(Frame::Ack { seq }).await;
-            return None;
-        }
+
+        // Got unexpected sequence - send NACK with what we expect
+        // This matches Go's simple logic: if seq != expected, send NACK
+        // Go does NOT have duplicate detection logic here - it just NACKs
         drop(recv);
+        trace!(target: "lnd_rs::gbn", seq, expected, "unexpected seq, sending NACK");
         let _ = self.send_raw(Frame::Nack { seq: expected }).await;
         None
     }
@@ -414,10 +452,6 @@ impl Inner {
 enum RecvEvent {
     Payload(ReceivedFrame),
     Fin,
-}
-
-fn seq_lte(a: u8, b: u8) -> bool {
-    b.wrapping_sub(a) < 128
 }
 
 pub struct GoBackNConn {
@@ -796,9 +830,11 @@ impl GoBackNConn {
 
 impl Inner {
     async fn next_seq(&self) -> u8 {
+        // Sequence space size: s = n + 1 (matches Go's cfg.s)
+        let s = self.opts.window_size + 1;
         let mut send = self.send_state.lock().await;
         let seq = send.next_seq;
-        send.next_seq = send.next_seq.wrapping_add(1);
+        send.next_seq = (send.next_seq + 1) % s;
         seq
     }
 

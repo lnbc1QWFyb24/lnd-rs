@@ -4,6 +4,7 @@ use crate::{
     proto,
     transport::{Transport, TransportError},
 };
+use std::time::Duration;
 use thiserror::Error;
 use tonic::{
     service::interceptor::InterceptedService, service::Interceptor as TonicInterceptor, Code,
@@ -80,6 +81,8 @@ pub struct Lnc<T: Transport> {
     creds: Box<dyn CredentialStore + Send + Sync>,
     connected: bool,
     config: LncConfig,
+    /// Per-RPC timeout applied to gRPC requests to avoid indefinite hangs.
+    rpc_timeout: Duration,
 }
 
 impl<T: Transport> Lnc<T> {
@@ -90,6 +93,7 @@ impl<T: Transport> Lnc<T> {
             creds: Box::new(InMemoryCredentialStore::default()),
             connected: false,
             config: LncConfig::default(),
+            rpc_timeout: Duration::from_secs(15),
         }
     }
 
@@ -100,6 +104,7 @@ impl<T: Transport> Lnc<T> {
             creds: store,
             connected: false,
             config: LncConfig::default(),
+            rpc_timeout: Duration::from_secs(15),
         }
     }
 
@@ -110,7 +115,14 @@ impl<T: Transport> Lnc<T> {
             creds: Box::new(InMemoryCredentialStore::default()),
             connected: false,
             config,
+            rpc_timeout: Duration::from_secs(15),
         }
+    }
+
+    /// Override the per-request timeout applied to gRPC calls.
+    pub fn with_rpc_timeout(mut self, timeout: Duration) -> Self {
+        self.rpc_timeout = timeout;
+        self
     }
 
     /// Construct an [`Lnc`] instance pre-configured with stored pairing credentials.
