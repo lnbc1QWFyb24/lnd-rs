@@ -4,6 +4,29 @@ use std::time::Duration;
 #[cfg(feature = "transport-mailbox")]
 use crate::transport::lncmailbox::gbn::GoBackNOptions;
 
+/// HTTP/2 keepalive configuration to prevent idle connection timeouts.
+#[cfg(feature = "transport-mailbox")]
+#[derive(Clone, Debug)]
+pub struct Http2KeepaliveConfig {
+    /// Interval between HTTP/2 PING frames. None to disable. Default: 10s.
+    pub interval: Option<Duration>,
+    /// Timeout for PING acknowledgement. Default: 20s.
+    pub timeout: Duration,
+    /// Send pings even when no streams are active. Default: true.
+    pub while_idle: bool,
+}
+
+#[cfg(feature = "transport-mailbox")]
+impl Default for Http2KeepaliveConfig {
+    fn default() -> Self {
+        Self {
+            interval: Some(Duration::from_secs(10)),
+            timeout: Duration::from_secs(20),
+            while_idle: true,
+        }
+    }
+}
+
 /// Default Lightning Node Connect mailbox host.
 pub const DEFAULT_SERVER_HOST: &str = "mailbox.terminal.lightning.today:443";
 
@@ -32,6 +55,8 @@ pub struct MailboxConfig {
     pub ws_send_timeout: Duration,
     /// Low-level Go-Back-N tuning knobs.
     pub gbn: GoBackNOptions,
+    /// HTTP/2 keepalive configuration to prevent idle connection timeouts.
+    pub http2_keepalive: Http2KeepaliveConfig,
 }
 
 #[cfg(feature = "transport-mailbox")]
@@ -43,6 +68,7 @@ impl Default for MailboxConfig {
             ws_connect_timeout: Duration::from_secs(10),
             ws_send_timeout: Duration::from_millis(1_000),
             gbn: GoBackNOptions::default(),
+            http2_keepalive: Http2KeepaliveConfig::default(),
         }
     }
 }

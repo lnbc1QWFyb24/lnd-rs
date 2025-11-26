@@ -97,8 +97,17 @@ static TEST_EPHEMERAL_RNG: LazyLock<Mutex<Option<StdRng>>> = LazyLock::new(|| Mu
 
 #[cfg(test)]
 /// Seed the deterministic RNG used by `gen_ephemeral` during tests.
+///
+/// Tests using this function should be marked with `#[serial]` to prevent
+/// concurrent access to the shared RNG state.
 pub fn seed_ephemeral_rng(seed: u64) {
     *TEST_EPHEMERAL_RNG.lock() = Some(StdRng::seed_from_u64(seed));
+}
+
+#[cfg(test)]
+/// Clear the deterministic RNG. Call at end of tests that use `seed_ephemeral_rng`.
+pub fn clear_ephemeral_rng() {
+    *TEST_EPHEMERAL_RNG.lock() = None;
 }
 
 #[cfg(test)]

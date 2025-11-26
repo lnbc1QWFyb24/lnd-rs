@@ -168,15 +168,17 @@ impl MailboxTransport {
     ) -> Result<Http2Channel, TransportError> {
         debug!(target: "lnd_rs::mailbox", "establishing HTTP/2 connection");
         let io = TokioIo::new(noise_conn);
-        let (send_request, conn) = timeout(
-            self.config.session_timeout,
-            hyper_http2::Builder::new(TokioExecutor::new()).handshake(io),
-        )
-        .await
-        .map_err(|_| {
-            TransportError::connection_message("HTTP/2 handshake timed out over Noise tunnel")
-        })?
-        .map_err(|e| TransportError::connection("HTTP/2 handshake failed", e))?;
+        let mut builder = hyper_http2::Builder::new(TokioExecutor::new());
+        let keepalive = &self.config.http2_keepalive;
+        builder.keep_alive_interval(keepalive.interval);
+        builder.keep_alive_timeout(keepalive.timeout);
+        builder.keep_alive_while_idle(keepalive.while_idle);
+        let (send_request, conn) = timeout(self.config.session_timeout, builder.handshake(io))
+            .await
+            .map_err(|_| {
+                TransportError::connection_message("HTTP/2 handshake timed out over Noise tunnel")
+            })?
+            .map_err(|e| TransportError::connection("HTTP/2 handshake failed", e))?;
         tokio::spawn(async move {
             trace!(target: "lnd_rs::mailbox::http2", "driver started");
             let res = conn.await;

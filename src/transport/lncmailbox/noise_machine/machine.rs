@@ -748,6 +748,7 @@ impl BrontideMachine {
 mod tests {
     use super::*;
     use crate::transport::lncmailbox::noise::HANDSHAKE_VERSION2;
+    use serial_test::serial;
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::thread;
@@ -824,6 +825,7 @@ mod tests {
         "a26a53fb728c7b84f3fa98b3248320eb0fb7e0575aa4b00e69af2c6202981004a702aaafb7cfb64897b5a7";
 
     #[test]
+    #[serial]
     fn xx_handshake_roundtrip_and_message() {
         let (mut client_stream, mut server_stream) = InMemoryStream::pair();
         let client_sk = Arc::new(SecretKey::random(&mut rand::thread_rng()));
@@ -907,6 +909,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn xx_handshake_matches_vector() {
         noise::seed_ephemeral_rng(42);
         let (mut client_stream, mut server_stream) = InMemoryStream::pair();
@@ -988,9 +991,11 @@ mod tests {
             .read_message(&mut server_stream)
             .expect("read vector");
         assert_eq!(plaintext, b"vector-xx");
+        noise::clear_ephemeral_rng();
     }
 
     #[test]
+    #[serial]
     fn kk_handshake_matches_vector() {
         noise::seed_ephemeral_rng(1337);
         let (mut client_stream, mut server_stream) = InMemoryStream::pair();
@@ -1055,5 +1060,6 @@ mod tests {
 
         let server_remote_hex = hex::encode(server_remote.to_encoded_point(true).as_bytes());
         assert_eq!(server_remote_hex, KK_REMOTE_HEX);
+        noise::clear_ephemeral_rng();
     }
 }

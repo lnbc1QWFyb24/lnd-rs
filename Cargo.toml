@@ -72,6 +72,7 @@ walkdir = "2"
 tokio-stream = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1"
+serial_test = "3"
 
 [[example]]
 name = "derive_sid"
