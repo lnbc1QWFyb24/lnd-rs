@@ -72,8 +72,9 @@ impl Default for GoBackNOptions {
             resend_multiplier: 5,
             timeout_update_frequency: 200,
             handshake_timeout_ms: 2000,
-            keepalive_ping_ms: 7000,
-            pong_timeout_ms: 3000,
+            // Looser keepalive to avoid tearing down long-running idle spans.
+            keepalive_ping_ms: 30000,
+            pong_timeout_ms: 15000,
             boost_percent: 0.5,
             window_size: 16, // gbn.DefaultN in Go
             max_chunk_size: 32 * 1024,
@@ -310,6 +311,7 @@ impl Inner {
         if let Some(p) = ping.as_ref() {
             if seq_lte(p.seq, ack) {
                 *ping = None;
+                debug!(target: "lnd_rs::gbn", ack_seq = ack, "keepalive ping acked");
             }
         }
     }
@@ -382,15 +384,19 @@ impl Inner {
             seq,
             sent_at: Instant::now(),
         });
+        debug!(target: "lnd_rs::gbn", seq, "keepalive ping sent");
     }
 
-    async fn pending_ping_expired(&self) -> bool {
+    async fn pending_ping_expired(&self) -> Option<(u8, Duration)> {
         let timeout = Duration::from_millis(self.opts.pong_timeout_ms);
         let ping = self.pending_ping.lock().await;
         if let Some(p) = ping.as_ref() {
-            return p.sent_at.elapsed() > timeout;
+            let elapsed = p.sent_at.elapsed();
+            if elapsed > timeout {
+                return Some((p.seq, elapsed));
+            }
         }
-        false
+        None
     }
 
     async fn time_since_remote(&self) -> Duration {
@@ -638,8 +644,8 @@ impl GoBackNConn {
             if !inner.handshake_complete.load(Ordering::SeqCst) {
                 continue;
             }
-            if inner.pending_ping_expired().await {
-                debug!(target: "lnd_rs::gbn", "keepalive ping expired; closing connection");
+            if let Some((seq, elapsed)) = inner.pending_ping_expired().await {
+                debug!(target: "lnd_rs::gbn", seq, elapsed_ms = elapsed.as_millis(), "keepalive ping expired; closing connection");
                 let _ = inner.recv_tx.send(RecvEvent::Fin).await;
                 inner.set_closed();
                 break;
