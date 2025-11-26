@@ -156,10 +156,12 @@ impl MailboxRecv {
                     let _ = socket.send(Message::Pong(payload)).await;
                 }
                 Some(Ok(Message::Close(_))) | None => {
+                    debug!(target: "lnd_rs::mailbox::ws", "recv socket closed; reconnecting");
                     self.socket = None;
                     return Err(WsError::Closed);
                 }
                 Some(Err(err)) => {
+                    debug!(target: "lnd_rs::mailbox::ws", error = %err, "recv socket error; reconnecting");
                     self.socket = None;
                     return Err(WsError::Transport(err.to_string()));
                 }
@@ -226,10 +228,12 @@ impl MailboxSend {
         match timeout(self.timeouts.send, send_fut).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err)) => {
+                debug!(target: "lnd_rs::mailbox::ws", error = %err, "send socket error; reconnecting");
                 self.socket = None;
                 Err(WsError::Transport(err.to_string()))
             }
             Err(_) => {
+                debug!(target: "lnd_rs::mailbox::ws", "send timeout; reconnecting");
                 self.socket = None;
                 Err(WsError::Transport("send timeout".into()))
             }

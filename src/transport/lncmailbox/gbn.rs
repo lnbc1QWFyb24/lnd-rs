@@ -73,10 +73,11 @@ impl Default for GoBackNOptions {
             timeout_update_frequency: 200,
             handshake_timeout_ms: 2000,
             // Looser keepalive to avoid tearing down long-running idle spans.
-            keepalive_ping_ms: 30000,
-            pong_timeout_ms: 15000,
+            // Increase interval/timeout further to cushion transient WS stalls.
+            keepalive_ping_ms: 60000,
+            pong_timeout_ms: 45000,
             boost_percent: 0.5,
-            window_size: 16, // gbn.DefaultN in Go
+            window_size: 20, // align with Go gbn.DefaultN (20)
             max_chunk_size: 32 * 1024,
             send_timeout_ms: None,
             recv_timeout_ms: None,
