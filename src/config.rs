@@ -8,7 +8,7 @@ use crate::transport::lncmailbox::gbn::GoBackNOptions;
 #[cfg(feature = "transport-mailbox")]
 #[derive(Clone, Debug)]
 pub struct Http2KeepaliveConfig {
-    /// Interval between HTTP/2 PING frames. None to disable. Default: 10s.
+    /// Interval between HTTP/2 PING frames. None to disable. Default: disabled.
     pub interval: Option<Duration>,
     /// Timeout for PING acknowledgement. Default: 20s.
     pub timeout: Duration,
@@ -20,7 +20,7 @@ pub struct Http2KeepaliveConfig {
 impl Default for Http2KeepaliveConfig {
     fn default() -> Self {
         Self {
-            interval: Some(Duration::from_secs(10)),
+            interval: None,
             timeout: Duration::from_secs(20),
             while_idle: true,
         }

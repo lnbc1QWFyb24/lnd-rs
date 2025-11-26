@@ -2,9 +2,17 @@
 
 //! Core mailbox connection metadata shared by the WS/GBN layers.
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use bytes::{BufMut, Bytes};
+use base64::Engine as _;
 use parking_lot::Mutex;
 use tokio::{
     sync::{mpsc, watch},
@@ -137,6 +145,7 @@ pub struct ClientConn {
     shutdown: watch::Sender<bool>,
     send_task: JoinHandle<()>,
     recv_task: JoinHandle<()>,
+    act1_logged: AtomicBool,
 }
 
 impl ClientConn {
@@ -246,6 +255,7 @@ impl ClientConn {
             shutdown: shutdown_tx,
             send_task,
             recv_task,
+            act1_logged: AtomicBool::new(false),
         })
     }
 
@@ -287,6 +297,20 @@ impl ClientConn {
     /// # Errors
     /// Returns a [`ClientConnError`] when the framed send fails.
     pub async fn send_control_msg(&self, msg: &ControlMsg) -> Result<(), ClientConnError> {
+        if !self.act1_logged.swap(true, Ordering::SeqCst) {
+            let payload = &msg.payload;
+            let ver = msg.version;
+            let len = msg.len();
+            let preview_len = payload.len().min(64);
+            let preview = base64::engine::general_purpose::STANDARD.encode(&payload[..preview_len]);
+            debug!(
+                target: "lnd_rs::mailbox::conn",
+                ctl_ver = ver,
+                ctl_len = len,
+                payload_b64_prefix = %preview,
+                "act1 control send"
+            );
+        }
         self.gbn
             .send_frame(Bytes::from(msg.encode()))
             .await

@@ -462,6 +462,7 @@ impl GoBackNConn {
                 Ok(Some(raw)) => {
                     match Frame::decode(&raw) {
                         Ok(Frame::Syn { window }) => {
+                            inner.update_remote_activity().await;
                             debug!(target: "lnd_rs::gbn", window, "<- SYN");
                             if window != opts.window_size {
                                 return Err(GoBackNConnError::Protocol("window mismatch"));
@@ -637,12 +638,6 @@ impl GoBackNConn {
             if !inner.handshake_complete.load(Ordering::SeqCst) {
                 continue;
             }
-            // Defer pings until at least one non-ping data frame has been
-            // acknowledged by the remote to avoid interference with early
-            // handshake/control messages.
-            if !inner.non_ping_acked.load(Ordering::SeqCst) {
-                continue;
-            }
             if inner.pending_ping_expired().await {
                 debug!(target: "lnd_rs::gbn", "keepalive ping expired; closing connection");
                 let _ = inner.recv_tx.send(RecvEvent::Fin).await;
@@ -662,6 +657,16 @@ impl GoBackNConn {
                 let _ = inner.recv_tx.send(RecvEvent::Fin).await;
                 inner.set_closed();
                 break;
+            }
+            // Defer pings until at least one non-ping data frame has been
+            // acknowledged by the remote to avoid interference with early
+            // handshake/control messages.
+            if !inner.non_ping_acked.load(Ordering::SeqCst) {
+                trace!(
+                    target: "lnd_rs::gbn",
+                    "skipping keepalive ping; no non-ping ack observed yet"
+                );
+                continue;
             }
             if !inner.has_send_window_capacity().await {
                 trace!(
@@ -1080,8 +1085,8 @@ mod tests {
 
         let opts = GoBackNOptions {
             window_size: 2,
-            keepalive_ping_ms: 50,
-            pong_timeout_ms: 50,
+            keepalive_ping_ms: 200,
+            pong_timeout_ms: 200,
             ..GoBackNOptions::default()
         };
 
