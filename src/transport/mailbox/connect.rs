@@ -35,6 +35,9 @@ impl MailboxConnectContext {
         debug!(
             target: "lnd_rs::mailbox",
             server_host = %server_host,
+            local_key_len = local_key_hex.len(),
+            remote_key_len = remote_key_hex.len(),
+            has_remote = !remote_key_hex.is_empty(),
             "transport.connect"
         );
         let words: Vec<String> = pairing_phrase

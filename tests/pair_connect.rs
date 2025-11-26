@@ -11,6 +11,15 @@ const MACAROON: &str = "ff00";
 struct MockTransport {
     metadata: Vec<(String, String)>,
     connected: bool,
+    last_connect_args: std::sync::Arc<std::sync::Mutex<Option<ConnectArgs>>>,
+}
+
+#[derive(Clone, Debug)]
+struct ConnectArgs {
+    server_host: String,
+    pairing_phrase: String,
+    local_key: String,
+    remote_key: String,
 }
 
 impl MockTransport {
@@ -18,6 +27,7 @@ impl MockTransport {
         Self {
             metadata: vec![("macaroon".to_string(), MACAROON.to_string())],
             connected: false,
+            last_connect_args: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -42,11 +52,17 @@ impl Transport for MockTransport {
 
     async fn connect(
         &mut self,
-        _server_host: &str,
-        _pairing_phrase: &str,
-        _local_key: &str,
-        _remote_key: &str,
+        server_host: &str,
+        pairing_phrase: &str,
+        local_key: &str,
+        remote_key: &str,
     ) -> Result<(), TransportError> {
+        *self.last_connect_args.lock().unwrap() = Some(ConnectArgs {
+            server_host: server_host.to_string(),
+            pairing_phrase: pairing_phrase.to_string(),
+            local_key: local_key.to_string(),
+            remote_key: remote_key.to_string(),
+        });
         self.connected = true;
         Ok(())
     }
@@ -109,4 +125,54 @@ async fn connect_syncs_remote_key_from_transport() {
         lnc.credentials_store().remote_key().as_deref(),
         Some(REMOTE_KEY)
     );
+}
+
+#[tokio::test]
+async fn from_credentials_populates_store_correctly() {
+    let creds = PairingCredentials {
+        server_host: "test.host:443".to_string(),
+        pairing_phrase: "arrive fun zebra ribbon mom".to_string(),
+        local_key: LOCAL_KEY.to_string(),
+        remote_key: REMOTE_KEY.to_string(),
+        macaroon_hex: Some(MACAROON.to_string()),
+    };
+
+    let transport = MockTransport::new();
+    let lnc = Lnc::from_credentials(transport, creds);
+
+    let store = lnc.credentials_store();
+    assert_eq!(store.server_host().as_deref(), Some("test.host:443"));
+    assert_eq!(
+        store.pairing_phrase().as_deref(),
+        Some("arrive fun zebra ribbon mom")
+    );
+    assert_eq!(store.local_key().as_deref(), Some(LOCAL_KEY));
+    assert_eq!(store.remote_key().as_deref(), Some(REMOTE_KEY));
+}
+
+#[tokio::test]
+async fn from_credentials_then_connect_passes_correct_args() {
+    let creds = PairingCredentials {
+        server_host: "test.host:443".to_string(),
+        pairing_phrase: "arrive fun zebra ribbon mom".to_string(),
+        local_key: LOCAL_KEY.to_string(),
+        remote_key: REMOTE_KEY.to_string(),
+        macaroon_hex: Some(MACAROON.to_string()),
+    };
+
+    let transport = MockTransport::new();
+    let args_ref = transport.last_connect_args.clone();
+    let mut lnc = Lnc::from_credentials(transport, creds);
+
+    lnc.connect().await.expect("connect");
+
+    let args = args_ref
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("connect was called");
+    assert_eq!(args.server_host, "test.host:443");
+    assert_eq!(args.pairing_phrase, "arrive fun zebra ribbon mom");
+    assert_eq!(args.local_key, LOCAL_KEY);
+    assert_eq!(args.remote_key, REMOTE_KEY);
 }
