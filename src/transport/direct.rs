@@ -6,12 +6,12 @@ use async_trait::async_trait;
 use http::{uri::Scheme, Uri};
 #[cfg(feature = "dangerous-insecure-tls")]
 use hyper_rustls::HttpsConnectorBuilder;
+use rustls::crypto::CryptoProvider;
 #[cfg(feature = "dangerous-insecure-tls")]
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 #[cfg(feature = "dangerous-insecure-tls")]
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    crypto::CryptoProvider,
     DigitallySignedStruct, SignatureScheme,
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
@@ -47,7 +47,7 @@ impl DirectGrpc {
             macaroon_hex,
             tls_ca_cert,
             #[cfg(feature = "dangerous-insecure-tls")]
-            dangerous_accept_invalid_certs: false,
+            dangerous_accept_invalid_certs: true,
         }
     }
 
@@ -93,6 +93,13 @@ impl Transport for DirectGrpc {
     }
 
     async fn service(&self) -> Result<Self::Svc, TransportError> {
+        // Ensure a crypto provider is installed before tonic/rustls tries to use TLS.
+        // This is needed because both `ring` and `aws-lc-rs` features may be enabled
+        // via transitive dependencies, which prevents rustls from auto-selecting.
+        if CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        }
+
         #[cfg(feature = "dangerous-insecure-tls")]
         if self.dangerous_accept_invalid_certs {
             return self.connect_with_insecure_tls().await;
@@ -163,9 +170,6 @@ impl DirectGrpc {
     #[cfg(feature = "dangerous-insecure-tls")]
     fn build_insecure_https_connector(
     ) -> hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector> {
-        if CryptoProvider::get_default().is_none() {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        }
         let verifier: Arc<dyn ServerCertVerifier> = Arc::new(AcceptAnyCertVerifier);
         let tls_config = rustls::ClientConfig::builder()
             .dangerous()

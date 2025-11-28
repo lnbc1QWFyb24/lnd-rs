@@ -15,22 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => Some(fs::read(path).await?),
         None => None,
     };
-    let insecure = args.iter().any(|a| a == "--insecure");
-
-    let transport = {
-        let base = DirectGrpc::new(addr, macaroon, tls);
-        #[cfg(feature = "dangerous-insecure-tls")]
-        {
-            base.dangerous_accept_invalid_certs(insecure)
-        }
-        #[cfg(not(feature = "dangerous-insecure-tls"))]
-        {
-            if insecure {
-                eprintln!("warning: --insecure requires the `dangerous-insecure-tls` feature; continuing with TLS verification enabled.");
-            }
-            base
-        }
-    };
+    let transport = DirectGrpc::new(addr, macaroon, tls);
     let mut lnc = Lnc::new(transport);
     lnc.connect().await?;
     let info = lnc.get_info().await?;
