@@ -123,7 +123,7 @@ impl MailboxRecv {
             "recv init"
         );
         let _ = ws.get_mut();
-        let send_fut = ws.send(Message::Text(init));
+        let send_fut = ws.send(Message::Text(init.into()));
         timeout(self.timeouts.send, send_fut)
             .await
             .map_err(|_| WsError::Transport("receive init timeout".into()))?
@@ -151,7 +151,7 @@ impl MailboxRecv {
                     let msg = parse_cipher_box(&unwrapped)?;
                     return Ok(msg);
                 }
-                Some(Ok(Message::Binary(data))) => return Ok(data),
+                Some(Ok(Message::Binary(data))) => return Ok(data.to_vec()),
                 Some(Ok(Message::Ping(payload))) => {
                     let _ = socket.send(Message::Pong(payload)).await;
                 }
@@ -224,7 +224,7 @@ impl MailboxSend {
         if payload.len() <= 8 {
             trace!(target: "lnd_rs::mailbox::ws", payload_json = %boxed, "send small payload");
         }
-        let send_fut = socket.send(Message::Text(boxed));
+        let send_fut = socket.send(Message::Text(boxed.into()));
         match timeout(self.timeouts.send, send_fut).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err)) => {

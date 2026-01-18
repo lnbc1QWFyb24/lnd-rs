@@ -49,7 +49,7 @@ async-trait = "0.1"
 tracing = "0.1"
 
 # Optional deps for mailbox transport (only pulled when feature enabled)
-tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"], optional = true }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], optional = true }
 futures-util = { version = "0.3", optional = true }
 url = { version = "2", optional = true }
 scrypt = { version = "0.11", optional = true }

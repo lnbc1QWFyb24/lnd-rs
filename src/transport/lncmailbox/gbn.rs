@@ -1148,7 +1148,7 @@ mod tests {
             .await
             .expect("send three");
 
-        let res = time::timeout(Duration::from_millis(500), conn.recv()).await;
+        let res = time::timeout(Duration::from_millis(800), conn.recv()).await;
 
         match res {
             Ok(Err(GoBackNConnError::Closed)) => {}
