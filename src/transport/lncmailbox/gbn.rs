@@ -251,16 +251,26 @@ impl Inner {
 
     async fn update_rtt(&self, sample: Duration) {
         let mut timeout = self.timeout.lock().await;
-        let blend = f64::from(self.opts.boost_percent.clamp(0.01, 0.99));
-        let current = timeout.as_secs_f64();
-        let updated = current * (1.0 - blend) + sample.as_secs_f64() * blend;
-        let min_timeout = 0.05;
-        let mut new_timeout = Duration::from_secs_f64(updated);
-        if new_timeout.as_secs_f64() < min_timeout {
-            new_timeout = Duration::from_secs_f64(min_timeout);
-        }
-        let scaled = new_timeout.mul_f64(f64::from(self.opts.resend_multiplier));
-        *timeout = scaled;
+        let raw_blend = f64::from(self.opts.boost_percent);
+        let blend = if raw_blend.is_finite() {
+            raw_blend.clamp(0.01, 0.99)
+        } else {
+            0.5
+        };
+
+        let updated = timeout.as_secs_f64() * (1.0 - blend) + sample.as_secs_f64() * blend;
+        let min_timeout_secs = 0.05_f64;
+        let safe_secs = if updated.is_finite() {
+            updated.max(min_timeout_secs)
+        } else {
+            min_timeout_secs
+        };
+
+        let base = Duration::try_from_secs_f64(safe_secs).unwrap_or(Duration::from_millis(50));
+
+        *timeout = base
+            .checked_mul(self.opts.resend_multiplier)
+            .unwrap_or(Duration::MAX);
     }
 
     async fn retransmit_candidates(&self) -> Vec<Frame> {
@@ -1099,6 +1109,23 @@ mod tests {
         let recv = conn.recv().await.expect("recv");
         assert_eq!(recv, Bytes::from_static(b"pong"));
         conn.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn update_rtt_with_nan_boost_percent_does_not_panic() {
+        let opts = GoBackNOptions {
+            boost_percent: f32::NAN,
+            resend_multiplier: 1,
+            ..GoBackNOptions::default()
+        };
+        let (outbound, _outbound_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (recv_tx, _recv_rx) = mpsc::channel::<RecvEvent>(1);
+        let inner = Inner::new(opts, outbound, recv_tx);
+
+        inner.update_rtt(Duration::from_millis(200)).await;
+
+        let timeout = *inner.timeout.lock().await;
+        assert_eq!(timeout, Duration::from_millis(300));
     }
 
     #[tokio::test(flavor = "current_thread")]

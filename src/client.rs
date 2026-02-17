@@ -120,6 +120,7 @@ impl<T: Transport> Lnc<T> {
     }
 
     /// Override the per-request timeout applied to gRPC calls.
+    #[must_use]
     pub fn with_rpc_timeout(mut self, timeout: Duration) -> Self {
         self.rpc_timeout = timeout;
         self
