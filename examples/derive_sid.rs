@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use k256::{PublicKey, SecretKey};
+use k256::{elliptic_curve::rand_core::OsRng, PublicKey, SecretKey};
 
 use lnd_rs::transport::lncmailbox::{aezeed, sid};
 
@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "artefact morning piano photo consider light".to_string());
     let words: Vec<String> = phrase.split_whitespace().map(str::to_string).collect();
     let entropy = aezeed::mnemonic_to_entropy(&words)?;
-    let local_sk = SecretKey::random(&mut rand::thread_rng());
+    let local_sk = SecretKey::random(&mut OsRng);
 
     // XX pattern (no remote)
     let sid_xx = sid::derive_sid(&entropy, &local_sk, None);

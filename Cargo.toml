@@ -1,6 +1,6 @@
 [package]
 name = "lnd-rs"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "Apache-2.0"
 description = "Rust crate for connecting to LND over direct gRPC or Lightning Node Connect (LNC) transports"
@@ -27,9 +27,10 @@ transport-mailbox = [
 dangerous-insecure-tls = []
 
 [dependencies]
-tonic = { version = "0.12", features = ["tls", "tls-roots"] }
-prost = "0.13"
-prost-types = "0.13"
+tonic = { version = "0.14", features = ["tls-aws-lc", "tls-webpki-roots"] }
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "net", "sync"] }
 tower = "0.5"
 hyper = { version = "1", features = ["client", "http2"] }
@@ -40,23 +41,23 @@ hyper-rustls = { version = "0.27", features = ["http2", "aws-lc-rs"] }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
+thiserror = "2"
 hex = "0.4"
-rand = "0.8"
-sha2 = "0.10"
+rand = "0.10"
+sha2 = "0.11"
 base64 = "0.22"
 async-trait = "0.1"
 tracing = "0.1"
 
 # Optional deps for mailbox transport (only pulled when feature enabled)
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], optional = true }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"], optional = true }
 futures-util = { version = "0.3", optional = true }
 url = { version = "2", optional = true }
-scrypt = { version = "0.11", optional = true }
-hmac = { version = "0.12", optional = true }
+scrypt = { version = "0.12", optional = true }
+hmac = { version = "0.13", optional = true }
 k256 = { version = "0.13", features = ["arithmetic", "ecdh"], optional = true }
 chacha20poly1305 = { version = "0.10", optional = true }
-hkdf = { version = "0.12", optional = true }
+hkdf = { version = "0.13", optional = true }
 hyper-util = { version = "0.1", features = ["client", "http2", "tokio"] }
 parking_lot = { version = "0.12", optional = true }
 
@@ -64,11 +65,11 @@ parking_lot = { version = "0.12", optional = true }
 # aes-gcm/pbkdf2/zeroize removed for now to avoid fetching new crates offline
 
 [build-dependencies]
-tonic-build = { version = "0.12", features = ["prost"] }
-prost-build = "0.13"
+tonic-prost-build = "0.14"
 walkdir = "2"
 
 [dev-dependencies]
+rand08 = { package = "rand", version = "0.8" }
 tokio-stream = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1"

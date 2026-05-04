@@ -748,6 +748,7 @@ impl BrontideMachine {
 mod tests {
     use super::*;
     use crate::transport::lncmailbox::noise::HANDSHAKE_VERSION2;
+    use k256::elliptic_curve::rand_core::OsRng;
     use serial_test::serial;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -828,8 +829,8 @@ mod tests {
     #[serial]
     fn xx_handshake_roundtrip_and_message() {
         let (mut client_stream, mut server_stream) = InMemoryStream::pair();
-        let client_sk = Arc::new(SecretKey::random(&mut rand::thread_rng()));
-        let server_sk = Arc::new(SecretKey::random(&mut rand::thread_rng()));
+        let client_sk = Arc::new(SecretKey::random(&mut OsRng));
+        let server_sk = Arc::new(SecretKey::random(&mut OsRng));
         let entropy = Arc::new(Sha256::digest(b"pairing entropy").to_vec());
         let auth_payload = b"macaroon-data".to_vec();
 

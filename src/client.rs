@@ -267,10 +267,10 @@ impl<T: Transport> Lnc<T> {
             LncGrpcService<T>,
         ) -> proto::lnrpc::lightning_client::LightningClient<LncGrpcService<T>>,
         T::Svc: tower::Service<
-            http::Request<tonic::body::BoxBody>,
-            Response = http::Response<tonic::body::BoxBody>,
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
         >,
-        <T::Svc as tower::Service<http::Request<tonic::body::BoxBody>>>::Error:
+        <T::Svc as tower::Service<http::Request<tonic::body::Body>>>::Error:
             Into<Box<dyn std::error::Error + Send + Sync>> + Send + Sync,
     {
         let svc = self.intercepted_service().await?;
@@ -284,10 +284,10 @@ impl<T: Transport> Lnc<T> {
     pub async fn get_info(&self) -> Result<proto::lnrpc::GetInfoResponse>
     where
         T::Svc: tower::Service<
-            http::Request<tonic::body::BoxBody>,
-            Response = http::Response<tonic::body::BoxBody>,
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
         >,
-        <T::Svc as tower::Service<http::Request<tonic::body::BoxBody>>>::Error:
+        <T::Svc as tower::Service<http::Request<tonic::body::Body>>>::Error:
             Into<Box<dyn std::error::Error + Send + Sync>> + Send + Sync,
     {
         let mut client = self.lightning_client().await?;
@@ -305,10 +305,10 @@ impl<T: Transport> Lnc<T> {
     pub async fn get_info_retry(&mut self) -> Result<proto::lnrpc::GetInfoResponse>
     where
         T::Svc: tower::Service<
-            http::Request<tonic::body::BoxBody>,
-            Response = http::Response<tonic::body::BoxBody>,
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
         >,
-        <T::Svc as tower::Service<http::Request<tonic::body::BoxBody>>>::Error:
+        <T::Svc as tower::Service<http::Request<tonic::body::Body>>>::Error:
             Into<Box<dyn std::error::Error + Send + Sync>> + Send + Sync,
     {
         // Gate on auth metadata: if missing, reconnect once to capture it.
@@ -358,10 +358,10 @@ impl<T: Transport> Lnc<T> {
     pub async fn service(&self) -> Result<LncGrpcService<T>>
     where
         T::Svc: tower::Service<
-            http::Request<tonic::body::BoxBody>,
-            Response = http::Response<tonic::body::BoxBody>,
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
         >,
-        <T::Svc as tower::Service<http::Request<tonic::body::BoxBody>>>::Error:
+        <T::Svc as tower::Service<http::Request<tonic::body::Body>>>::Error:
             Into<Box<dyn std::error::Error + Send + Sync>> + Send + Sync,
     {
         self.intercepted_service().await
@@ -384,10 +384,10 @@ impl<T: Transport> Lnc<T> {
     ) -> Result<proto::lnrpc::lightning_client::LightningClient<LncGrpcService<T>>>
     where
         T::Svc: tower::Service<
-            http::Request<tonic::body::BoxBody>,
-            Response = http::Response<tonic::body::BoxBody>,
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
         >,
-        <T::Svc as tower::Service<http::Request<tonic::body::BoxBody>>>::Error:
+        <T::Svc as tower::Service<http::Request<tonic::body::Body>>>::Error:
             Into<Box<dyn std::error::Error + Send + Sync>> + Send + Sync,
     {
         // Use with_origin so tonic sets :authority on HTTP/2 requests. Without
@@ -418,10 +418,10 @@ impl<T: Transport> Lnc<T> {
     ) -> Result<proto::lnrpc::lightning_client::LightningClient<LncGrpcService<T>>>
     where
         T::Svc: tower::Service<
-            http::Request<tonic::body::BoxBody>,
-            Response = http::Response<tonic::body::BoxBody>,
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
         >,
-        <T::Svc as tower::Service<http::Request<tonic::body::BoxBody>>>::Error:
+        <T::Svc as tower::Service<http::Request<tonic::body::Body>>>::Error:
             Into<Box<dyn std::error::Error + Send + Sync>> + Send + Sync,
     {
         let interceptor = LncInterceptor {
@@ -445,10 +445,10 @@ impl<T: Transport> Lnc<T> {
     async fn intercepted_service(&self) -> Result<LncGrpcService<T>>
     where
         T::Svc: tower::Service<
-            http::Request<tonic::body::BoxBody>,
-            Response = http::Response<tonic::body::BoxBody>,
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
         >,
-        <T::Svc as tower::Service<http::Request<tonic::body::BoxBody>>>::Error:
+        <T::Svc as tower::Service<http::Request<tonic::body::Body>>>::Error:
             Into<Box<dyn std::error::Error + Send + Sync>> + Send + Sync,
     {
         let svc = self.transport.service().await.map_err(LncError::from)?;

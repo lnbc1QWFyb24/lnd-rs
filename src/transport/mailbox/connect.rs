@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use base64::Engine;
-use k256::{PublicKey, SecretKey};
+use k256::{elliptic_curve::rand_core::OsRng, PublicKey, SecretKey};
 use parking_lot::Mutex;
 use tracing::{debug, trace};
 
@@ -49,7 +49,7 @@ impl MailboxConnectContext {
         })?;
 
         let local_sk = if local_key_hex.is_empty() {
-            SecretKey::random(&mut rand::thread_rng())
+            SecretKey::random(&mut OsRng)
         } else {
             SecretKey::from_slice(
                 &hex::decode(local_key_hex)

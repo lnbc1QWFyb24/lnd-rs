@@ -2,24 +2,21 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use http_body_util::BodyExt as _;
 use hyper::client::conn::http2;
 use hyper::Error as HyperError;
+use tonic::body::Body;
 use tower::Service;
 use tracing::{debug, trace};
 
 /// Minimal HTTP/2 client that wraps the underlying hashmail Noise transport.
 #[derive(Clone)]
 pub struct Http2Channel {
-    pub(super) send_request: http2::SendRequest<tonic::body::BoxBody>,
+    pub(super) send_request: http2::SendRequest<Body>,
     pub(super) authority: http::uri::Authority,
 }
 
 impl Http2Channel {
-    pub fn new(
-        send_request: http2::SendRequest<tonic::body::BoxBody>,
-        authority: http::uri::Authority,
-    ) -> Self {
+    pub fn new(send_request: http2::SendRequest<Body>, authority: http::uri::Authority) -> Self {
         Self {
             send_request,
             authority,
@@ -27,8 +24,8 @@ impl Http2Channel {
     }
 }
 
-impl Service<http::Request<tonic::body::BoxBody>> for Http2Channel {
-    type Response = http::Response<tonic::body::BoxBody>;
+impl Service<http::Request<Body>> for Http2Channel {
+    type Response = http::Response<Body>;
     type Error = HyperError;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -36,7 +33,7 @@ impl Service<http::Request<tonic::body::BoxBody>> for Http2Channel {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, mut req: http::Request<tonic::body::BoxBody>) -> Self::Future {
+    fn call(&mut self, mut req: http::Request<Body>) -> Self::Future {
         if req.uri().scheme().is_none() || req.uri().authority().is_none() {
             let path_and_query = req
                 .uri()
@@ -100,10 +97,7 @@ impl Service<http::Request<tonic::body::BoxBody>> for Http2Channel {
                 version = ?parts.version,
                 "received response"
             );
-            let body = body
-                .map_err(|e| tonic::Status::internal(e.to_string()))
-                .boxed_unsync();
-            Ok(http::Response::from_parts(parts, body))
+            Ok(http::Response::from_parts(parts, Body::new(body)))
         })
     }
 }

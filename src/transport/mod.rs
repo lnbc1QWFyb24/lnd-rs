@@ -1,7 +1,7 @@
 use std::{borrow::Cow, error::Error};
 
 use async_trait::async_trait;
-use tonic::{body::BoxBody, client::GrpcService};
+use tonic::{body::Body, client::GrpcService};
 
 use crate::PairingCredentials;
 
@@ -47,7 +47,7 @@ impl TransportError {
 #[async_trait]
 pub trait Transport: Send + Sync {
     /// The underlying gRPC service used by tonic clients.
-    type Svc: GrpcService<BoxBody> + Clone + Send + Sync + 'static;
+    type Svc: GrpcService<Body> + Clone + Send + Sync + 'static;
     /// Perform initial pairing using a pairing phrase. Return credentials to persist.
     async fn pair(
         &mut self,

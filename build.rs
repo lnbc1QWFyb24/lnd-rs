@@ -32,7 +32,7 @@ fn main() {
     fs::create_dir_all(&out_dir).unwrap();
 
     let serde_attr = "#[derive(serde::Serialize, serde::Deserialize)]";
-    let builder = tonic_build::configure()
+    let builder = tonic_prost_build::configure()
         .build_server(false)
         .build_client(true)
         .out_dir(&out_dir)

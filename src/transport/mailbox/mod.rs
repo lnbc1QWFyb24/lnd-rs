@@ -28,7 +28,7 @@ use hyper::client::conn::http2 as hyper_http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 #[cfg(feature = "transport-mailbox")]
 use k256::elliptic_curve::sec1::ToEncodedPoint;
-use rand::RngCore;
+use rand::TryRng;
 #[cfg(feature = "transport-mailbox")]
 use std::sync::Arc;
 #[cfg(feature = "transport-mailbox")]
@@ -249,7 +249,9 @@ impl Transport for MailboxTransport {
         // Generate a random 32-byte local private key (hex). In the full
         // implementation this key is used for Noise handshake and reconnection.
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut bytes)
+            .map_err(|e| TransportError::connection("secure random generation failed", e))?;
         let local_key = hex::encode(bytes);
 
         Ok(PairingCredentials {

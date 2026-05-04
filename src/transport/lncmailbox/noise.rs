@@ -1,12 +1,13 @@
 #![cfg(feature = "transport-mailbox")]
 
 use k256::{
-    elliptic_curve::ops::Reduce, FieldBytes, ProjectivePoint, PublicKey, Scalar, SecretKey, U256,
+    elliptic_curve::ops::Reduce, elliptic_curve::rand_core::OsRng, FieldBytes, ProjectivePoint,
+    PublicKey, Scalar, SecretKey, U256,
 };
 #[cfg(test)]
 use parking_lot::Mutex;
 #[cfg(test)]
-use rand::{rngs::StdRng, SeedableRng};
+use rand08::{rngs::StdRng, SeedableRng};
 #[cfg(test)]
 use std::sync::LazyLock;
 
@@ -87,7 +88,7 @@ pub fn gen_ephemeral() -> (SecretKey, PublicKey) {
             return (sk, pk);
         }
     }
-    let sk = SecretKey::random(&mut rand::thread_rng());
+    let sk = SecretKey::random(&mut OsRng);
     let pk = PublicKey::from_secret_scalar(&sk.to_nonzero_scalar());
     (sk, pk)
 }

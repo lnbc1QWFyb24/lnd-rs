@@ -1,6 +1,6 @@
 #![cfg(feature = "transport-mailbox")]
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 /// Compute `HMAC-SHA256(key, msg)` and return the raw 32-byte digest.
@@ -28,7 +28,7 @@ pub fn scrypt_stretch(entropy: &[u8]) -> Result<Vec<u8>, String> {
     scrypt::scrypt(
         entropy,
         entropy,
-        &scrypt::Params::new(16, 8, 1, 32).map_err(|e| e.to_string())?,
+        &scrypt::Params::new(16, 8, 1).map_err(|e| e.to_string())?,
         &mut out,
     )
     .map_err(|e| e.to_string())?;
