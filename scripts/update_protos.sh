@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Fetch LND lnrpc protos for a given release tag, mirroring lnc-core behavior
+# Fetch LND protos for a given release tag, mirroring lnc-core behavior
 # Usage: scripts/update_protos.sh v0.17.5-beta
 
 if [[ $# -lt 1 ]]; then
@@ -24,5 +24,7 @@ fetch() {
 }
 
 fetch "$LND_URL/$LND_RELEASE_TAG/lnrpc/lightning.proto" "$PROTO_DIR/lightning.proto"
+fetch "$LND_URL/$LND_RELEASE_TAG/lnrpc/signrpc/signer.proto" "$PROTO_DIR/signrpc/signer.proto"
+fetch "$LND_URL/$LND_RELEASE_TAG/lnrpc/walletrpc/walletkit.proto" "$PROTO_DIR/walletrpc/walletkit.proto"
 
 echo "Done. Set LND_TAG=$LND_RELEASE_TAG for build.rs or rely on first tag directory."

@@ -2,7 +2,7 @@ use std::{env, fs, path::PathBuf};
 use walkdir::WalkDir;
 
 fn main() {
-    // Build only LND lnrpc lightning.proto (and includes) from the latest downloaded tag
+    // Build LND protos from the latest downloaded tag.
     let protos_root = PathBuf::from("protos/lnd");
 
     // Deterministically select a tag directory, or use LND_TAG if provided.
@@ -37,21 +37,30 @@ fn main() {
         .build_client(true)
         .out_dir(&out_dir)
         .type_attribute(".lnrpc", serde_attr)
+        .type_attribute(".signrpc", serde_attr)
+        .type_attribute(".walletrpc", serde_attr)
         .compile_well_known_types(true)
         .extern_path(".google.protobuf", "::prost_types");
 
-    let proto_file = proto_dir.join("lightning.proto");
-    if !proto_file.exists() {
-        println!(
-            "cargo:warning=Expected {} but it was not found. Skipping proto build.",
-            proto_file.display()
-        );
-        return;
+    let proto_files = [
+        proto_dir.join("lightning.proto"),
+        proto_dir.join("signrpc/signer.proto"),
+        proto_dir.join("walletrpc/walletkit.proto"),
+    ];
+
+    for proto_file in &proto_files {
+        if !proto_file.exists() {
+            println!(
+                "cargo:warning=Expected {} but it was not found. Skipping proto build.",
+                proto_file.display()
+            );
+            return;
+        }
     }
 
     let includes = [proto_dir.clone()];
 
-    match builder.compile_protos(&[proto_file], &includes) {
+    match builder.compile_protos(&proto_files, &includes) {
         Ok(()) => {}
         Err(e) => {
             println!("cargo:warning=proto compile failed: {e}");
