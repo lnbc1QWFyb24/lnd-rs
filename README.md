@@ -47,12 +47,13 @@ Directory structure
 - `src/` – library sources
 - `docs/` – conceptual docs and guides
 
-Protos (required before build)
-- Fetch LND `lnrpc` protos for a specific tag, then build.
-- Example:
-  - `scripts/update_protos.sh v0.17.5-beta`
-  - `cargo build`
+Protos
+- The bundled `lnrpc`, `signrpc`, and `walletrpc` protos are from LND `v0.21.3-beta`.
+- To replace them with another release's protos, run `scripts/update_protos.sh <LND_TAG>` and then `cargo build`.
 - `build.rs` selects `protos/lnd/$LND_TAG` if `LND_TAG` is set, otherwise the last tag directory.
+- LND v0.21 removed the legacy `lnrpc` payment RPCs. The generated `LightningClient` no longer
+  exposes `SendPayment`, `SendPaymentSync`, `SendToRoute`, or `SendToRouteSync`; their V2 replacements
+  are in `routerrpc`, which this crate does not currently bundle.
 
 Usage: direct gRPC
 

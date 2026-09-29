@@ -6,17 +6,18 @@ Lightning Node Connect (LNC) mailbox transport.
 Prerequisites
 - Rust stable and `cargo` installed
 - Tokio runtime in your binary (`rt-multi-thread`, `macros`)
-- LND protos prepared (see below)
+- Bundled LND `v0.21.3-beta` protos (included in this crate)
 
-1) Fetch LND protos
+1) Build with the bundled LND protos
 
 ```
-scripts/update_protos.sh v0.17.5-beta
 cargo build
 ```
 
-`build.rs` compiles `lightning.proto` for the selected tag. Set `LND_TAG` to force a specific tag;
-otherwise the newest directory under `protos/lnd/` is used.
+`build.rs` compiles the bundled `lightning.proto`, `signer.proto`, and `walletkit.proto`.
+To use another LND release, run `scripts/update_protos.sh <LND_TAG>` first. Set `LND_TAG`
+to select a specific local tag directory; otherwise the last directory under `protos/lnd/`
+is used.
 
 2) Choose a transport and enable features
 
@@ -102,4 +103,3 @@ Troubleshooting
 - Proto build not running: ensure a `protos/lnd/<tag>/lightning.proto` exists or set `LND_TAG`.
 - `Unavailable`/`Unknown` on first RPC: use `get_info_retry()` which reconnects once if auth
   metadata was not captured, or call `connect()` again after clearing any stale state.
-

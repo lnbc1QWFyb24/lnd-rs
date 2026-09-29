@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Fetch LND protos for a given release tag, mirroring lnc-core behavior
-# Usage: scripts/update_protos.sh v0.17.5-beta
+# Usage: scripts/update_protos.sh v0.21.3-beta
 
 if [[ $# -lt 1 ]]; then
   echo "usage: $0 <LND_RELEASE_TAG>" >&2
@@ -27,4 +27,4 @@ fetch "$LND_URL/$LND_RELEASE_TAG/lnrpc/lightning.proto" "$PROTO_DIR/lightning.pr
 fetch "$LND_URL/$LND_RELEASE_TAG/lnrpc/signrpc/signer.proto" "$PROTO_DIR/signrpc/signer.proto"
 fetch "$LND_URL/$LND_RELEASE_TAG/lnrpc/walletrpc/walletkit.proto" "$PROTO_DIR/walletrpc/walletkit.proto"
 
-echo "Done. Set LND_TAG=$LND_RELEASE_TAG for build.rs or rely on first tag directory."
+echo "Done. Set LND_TAG=$LND_RELEASE_TAG for build.rs or rely on the bundled tag directory."
