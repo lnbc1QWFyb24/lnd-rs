@@ -11,6 +11,16 @@ pub(crate) struct MailboxState {
     pub(crate) svc: Http2Channel,
     pub(crate) metadata: Arc<[(String, String)]>,
     pub(crate) status_rx: watch::Receiver<ClientStatus>,
+    pub(crate) _driver: Http2Driver,
+}
+
+/// Owns the HTTP/2 background task so cancellation and transport drop abort it.
+pub(crate) struct Http2Driver(pub(crate) tokio::task::JoinHandle<()>);
+
+impl Drop for Http2Driver {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 pub fn parse_auth_metadata(raw: &[u8]) -> Vec<(String, String)> {

@@ -1,0 +1,1 @@
+Synthetic loopback TLS fixtures copied byte-for-byte from Clams LND transport tests. The server certificate covers only DNS localhost. The private key is public test data; it is never used for a wallet or deployed service. These copies keep the vendored dependency tests self-contained.

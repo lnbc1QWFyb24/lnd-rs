@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::{
     pin,
     sync::{mpsc, oneshot, Mutex, Notify},
@@ -26,6 +26,14 @@ pub use crate::transport::lncmailbox::gbn_wire::{
 };
 
 const NO_TIMEOUT: u64 = u64::MAX;
+
+mod inbound;
+mod receive;
+use super::receive_budget::ReceiveBudget;
+use inbound::Inbound;
+
+#[cfg(test)]
+mod privacy_tests;
 
 // Re-export wire frame types so external paths remain stable.
 
@@ -132,6 +140,7 @@ struct PendingPing {
 }
 
 struct Inner {
+    receive_budget: Option<ReceiveBudget>,
     opts: GoBackNOptions,
     outbound: mpsc::Sender<Vec<u8>>,
     send_state: Mutex<SendState>,
@@ -163,6 +172,7 @@ impl Inner {
         let send_timeout = opts.send_timeout_ms.map(Duration::from_millis);
         let recv_timeout = opts.recv_timeout_ms.map(Duration::from_millis);
         Self {
+            receive_budget: None,
             opts,
             outbound,
             send_state: Mutex::new(SendState {
@@ -187,6 +197,26 @@ impl Inner {
             non_ping_acked: AtomicBool::new(false),
             post_synack_gate: Notify::new(),
             gate_required: AtomicBool::new(false),
+        }
+    }
+
+    fn receive_closed_error(&self) -> GoBackNConnError {
+        if self
+            .receive_budget
+            .as_ref()
+            .is_some_and(ReceiveBudget::exhausted)
+        {
+            GoBackNConnError::Protocol("receive retention budget exceeded")
+        } else {
+            GoBackNConnError::Closed
+        }
+    }
+
+    async fn emit(&self, event: RecvEvent) -> Result<(), GoBackNConnError> {
+        tokio::select! {
+            biased;
+            () = inbound::closed(self.receive_budget.as_ref()) => Err(self.receive_closed_error()),
+            result = self.recv_tx.send(event) => result.map_err(|_| GoBackNConnError::Closed),
         }
     }
 
@@ -243,10 +273,11 @@ impl Inner {
                 trace!(target: "lnd_rs::gbn::inner", frame = ?frame, bytes = encoded.len(), "send_raw");
             }
         }
-        self.outbound
-            .send(encoded)
-            .await
-            .map_err(|_| GoBackNConnError::TransportClosed)
+        tokio::select! {
+            biased;
+            () = inbound::closed(self.receive_budget.as_ref()) => Err(self.receive_closed_error()),
+            result = self.outbound.send(encoded) => result.map_err(|_| GoBackNConnError::TransportClosed),
+        }
     }
 
     async fn update_rtt(&self, sample: Duration) {
@@ -415,7 +446,7 @@ impl Inner {
             let mut recv = self.recv_state.lock().await;
             recv.remote_closed = true;
         }
-        let _ = self.recv_tx.send(RecvEvent::Fin).await;
+        let _ = self.emit(RecvEvent::Fin).await;
     }
 
     fn is_closed(&self) -> bool {
@@ -466,7 +497,7 @@ enum RecvEvent {
 
 pub struct GoBackNConn {
     inner: Arc<Inner>,
-    data_rx: Mutex<mpsc::Receiver<RecvEvent>>,
+    data_rx: Arc<Mutex<mpsc::Receiver<RecvEvent>>>,
     reader: JoinHandle<()>,
     resend_task: JoinHandle<()>,
     keepalive_task: JoinHandle<()>,
@@ -492,11 +523,31 @@ impl GoBackNConn {
     pub async fn connect(
         opts: GoBackNOptions,
         outbound: mpsc::Sender<Vec<u8>>,
-        mut inbound: mpsc::Receiver<Vec<u8>>,
+        inbound: mpsc::Receiver<Vec<u8>>,
+    ) -> Result<Self, GoBackNConnError> {
+        Self::connect_inner(opts, outbound, Inbound::Public(inbound), None).await
+    }
+
+    pub(super) async fn connect_budgeted(
+        opts: GoBackNOptions,
+        outbound: mpsc::Sender<Vec<u8>>,
+        inbound: mpsc::Receiver<Bytes>,
+        budget: ReceiveBudget,
+    ) -> Result<Self, GoBackNConnError> {
+        Self::connect_inner(opts, outbound, Inbound::Budgeted(inbound), Some(budget)).await
+    }
+
+    async fn connect_inner(
+        opts: GoBackNOptions,
+        outbound: mpsc::Sender<Vec<u8>>,
+        mut inbound: Inbound,
+        budget: Option<ReceiveBudget>,
     ) -> Result<Self, GoBackNConnError> {
         let (recv_tx, recv_rx) = mpsc::channel::<RecvEvent>(opts.window_size as usize * 4);
-        let inner = Arc::new(Inner::new(opts.clone(), outbound.clone(), recv_tx));
-        let data_rx = Mutex::new(recv_rx);
+        let mut inner = Inner::new(opts.clone(), outbound.clone(), recv_tx);
+        inner.receive_budget = budget;
+        let inner = Arc::new(inner);
+        let data_rx = Arc::new(Mutex::new(recv_rx));
 
         // Synchronous client handshake: SYN -> wait SYN <- then -> SYNACK.
         debug!(target: "lnd_rs::gbn", window = opts.window_size, "-> SYN");
@@ -509,9 +560,14 @@ impl GoBackNConn {
         let handshake_deadline = Duration::from_millis(opts.handshake_timeout_ms);
         loop {
             // Wait for the server's SYN within the deadline. If timeout, resend SYN.
-            match time::timeout(handshake_deadline, inbound.recv()).await {
+            match time::timeout(
+                handshake_deadline,
+                inbound.recv(inner.receive_budget.as_ref()),
+            )
+            .await
+            {
                 Ok(Some(raw)) => {
-                    match Frame::decode(&raw) {
+                    match Frame::decode_shared(&raw) {
                         Ok(Frame::Syn { window }) => {
                             inner.update_remote_activity().await;
                             debug!(target: "lnd_rs::gbn", window, "<- SYN");
@@ -531,9 +587,9 @@ impl GoBackNConn {
                             debug!(target: "lnd_rs::gbn", "<- SYNACK (waiting for SYN)");
                             inner.update_remote_activity().await;
                         }
-                        Ok(other) => {
+                        Ok(_) => {
                             // Ignore non-handshake frames until handshake completes.
-                            trace!(target: "lnd_rs::gbn", frame = ?other, "(handshake) ignoring");
+                            trace!(target: "lnd_rs::gbn", "(handshake) ignoring non-handshake frame");
                         }
                         Err(_) => {
                             // Ignore undecodable frames.
@@ -557,8 +613,16 @@ impl GoBackNConn {
 
         // Only spawn runtime tasks after handshake is complete.
         let reader_inner = inner.clone();
+        let reader_receiver = data_rx.clone();
         let reader = tokio::spawn(async move {
-            GoBackNConn::reader_loop(reader_inner, inbound, None).await;
+            GoBackNConn::reader_loop(reader_inner.clone(), inbound, None).await;
+            if reader_inner
+                .receive_budget
+                .as_ref()
+                .is_some_and(ReceiveBudget::is_closed)
+            {
+                discard_received(&reader_receiver).await;
+            }
         });
 
         let resend_inner = inner.clone();
@@ -580,11 +644,11 @@ impl GoBackNConn {
 
     async fn reader_loop(
         inner: Arc<Inner>,
-        mut inbound: mpsc::Receiver<Vec<u8>>,
+        mut inbound: Inbound,
         mut handshake: Option<oneshot::Sender<Result<(), GoBackNConnError>>>,
     ) {
-        while let Some(raw) = inbound.recv().await {
-            match Frame::decode(&raw) {
+        while let Some(raw) = inbound.recv(inner.receive_budget.as_ref()).await {
+            match Frame::decode_shared(&raw) {
                 Ok(Frame::Syn { window }) => {
                     debug!(target: "lnd_rs::gbn", window, "<- SYN");
                     inner.update_remote_activity().await;
@@ -648,7 +712,9 @@ impl GoBackNConn {
                     inner.update_remote_activity().await;
                     inner.maybe_release_post_synack_gate();
                     if let Some(ev) = inner.handle_data(seq, final_chunk, is_ping, payload).await {
-                        let _ = inner.recv_tx.send(ev).await;
+                        if inner.emit(ev).await.is_err() {
+                            break;
+                        }
                     }
                 }
                 Ok(Frame::Fin) => {
@@ -691,7 +757,7 @@ impl GoBackNConn {
             }
             if let Some((seq, elapsed)) = inner.pending_ping_expired().await {
                 debug!(target: "lnd_rs::gbn", seq, elapsed_ms = elapsed.as_millis(), "keepalive ping expired; closing connection");
-                let _ = inner.recv_tx.send(RecvEvent::Fin).await;
+                let _ = inner.emit(RecvEvent::Fin).await;
                 inner.set_closed();
                 break;
             }
@@ -705,7 +771,7 @@ impl GoBackNConn {
                     budget_ms = idle_budget.as_millis(),
                     "keepalive idle budget exceeded; closing connection"
                 );
-                let _ = inner.recv_tx.send(RecvEvent::Fin).await;
+                let _ = inner.emit(RecvEvent::Fin).await;
                 inner.set_closed();
                 break;
             }
@@ -735,13 +801,12 @@ impl GoBackNConn {
                 let budget = Duration::from_millis(inner.opts.pong_timeout_ms);
                 match time::timeout(budget, send_ping).await {
                     Ok(Ok(seq)) => inner.register_ping(seq).await,
-                    Ok(Err(err)) => {
+                    Ok(Err(_)) => {
                         debug!(
                             target: "lnd_rs::gbn",
-                            error = %err,
                             "keepalive ping send failed; closing connection"
                         );
-                        let _ = inner.recv_tx.send(RecvEvent::Fin).await;
+                        let _ = inner.emit(RecvEvent::Fin).await;
                         inner.set_closed();
                         break;
                     }
@@ -750,7 +815,7 @@ impl GoBackNConn {
                             target: "lnd_rs::gbn",
                             "keepalive ping send stalled; closing connection"
                         );
-                        let _ = inner.recv_tx.send(RecvEvent::Fin).await;
+                        let _ = inner.emit(RecvEvent::Fin).await;
                         inner.set_closed();
                         break;
                     }
@@ -788,15 +853,21 @@ impl GoBackNConn {
     pub async fn recv_frame(&self) -> Result<ReceivedFrame, GoBackNConnError> {
         let timeout = self.inner.current_recv_timeout();
         let mut rx = self.data_rx.lock().await;
-        let recv_fut = rx.recv();
+        let recv_fut = async {
+            tokio::select! {
+                biased;
+                () = inbound::closed(self.inner.receive_budget.as_ref()) => Err(self.inner.receive_closed_error()),
+                item = rx.recv() => Ok(item),
+            }
+        };
         pin!(recv_fut);
         let item = if let Some(duration) = timeout {
             match time::timeout(duration, recv_fut).await {
-                Ok(v) => v,
+                Ok(v) => v?,
                 Err(_) => return Err(GoBackNConnError::RecvTimeout),
             }
         } else {
-            recv_fut.await
+            recv_fut.await?
         };
 
         match item {
@@ -808,18 +879,25 @@ impl GoBackNConn {
     /// Receive and assemble a complete message that may span multiple frames.
     ///
     /// # Errors
-    /// Returns a [`GoBackNConnError`] when the connection closes mid-transfer.
+    /// Returns a [`GoBackNConnError`] when the connection closes mid-transfer,
+    /// exceeds 64 MiB, or exceeds 65,536 fragments (including empty fragments).
+    /// Consumed partial data is discarded on failure; callers must discard the
+    /// connection rather than treating the remaining fragments as a new message.
     pub async fn recv(&self) -> Result<Bytes, GoBackNConnError> {
-        let mut buf = BytesMut::new();
-        loop {
-            let part = self.recv_frame().await?;
-            if !part.payload.is_empty() {
-                buf.extend_from_slice(&part.payload);
-            }
-            if part.final_chunk {
-                return Ok(buf.freeze());
-            }
-        }
+        self.recv_with_limits(receive::MAX_MESSAGE_BYTES, receive::MAX_MESSAGE_FRAGMENTS)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(super) fn receive_reservation(&self) -> Option<ReceiveBudget> {
+        self.inner.receive_budget.clone()
+    }
+
+    pub(super) async fn discard_received(&self) {
+        self.reader.abort();
+        self.resend_task.abort();
+        self.keepalive_task.abort();
+        discard_received(&self.data_rx).await;
     }
 
     /// Gracefully close the connection by sending `FIN` once.
@@ -836,6 +914,12 @@ impl GoBackNConn {
         }
         self.inner.send_raw(Frame::Fin).await
     }
+}
+
+async fn discard_received(receiver: &Mutex<mpsc::Receiver<RecvEvent>>) {
+    let mut receiver = receiver.lock().await;
+    receiver.close();
+    while receiver.try_recv().is_ok() {}
 }
 
 impl Inner {

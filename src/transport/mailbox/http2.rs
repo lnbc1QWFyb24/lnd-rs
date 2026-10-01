@@ -65,7 +65,6 @@ impl Service<http::Request<Body>> for Http2Channel {
         debug!(
             target: "lnd_rs::mailbox::http2",
             method = %req.method(),
-            uri = %req.uri(),
             te = ?req.headers().get(http::header::TE),
             content_type = ?req.headers().get(http::header::CONTENT_TYPE),
             "sending request"

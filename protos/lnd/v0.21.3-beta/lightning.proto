@@ -5250,7 +5250,7 @@ message MetadataValues {
 
 message StreamAuth {
     /*
-    The full URI (in the format /<rpcpackage>.<ServiceName>/MethodName, for
+    The full URI (in the format `/<rpcpackage>.<ServiceName>/MethodName`, for
     example /lnrpc.Lightning/GetInfo) of the streaming RPC method that was just
     established.
     */
@@ -5259,7 +5259,7 @@ message StreamAuth {
 
 message RPCMessage {
     /*
-    The full URI (in the format /<rpcpackage>.<ServiceName>/MethodName, for
+    The full URI (in the format `/<rpcpackage>.<ServiceName>/MethodName`, for
     example /lnrpc.Lightning/GetInfo) of the RPC method the message was sent
     to/from.
     */
@@ -5272,7 +5272,7 @@ message RPCMessage {
 
     /*
     The full canonical gRPC name of the message type (in the format
-    <rpcpackage>.TypeName, for example lnrpc.GetInfoRequest). In case of an
+    `<rpcpackage>.TypeName`, for example lnrpc.GetInfoRequest). In case of an
     error being returned from lnd, this simply contains the string "error".
     */
     string type_name = 3;

@@ -61,14 +61,21 @@ Dev-only insecure TLS: enable the `dangerous-insecure-tls` feature and pass `--i
 
 ```rust
 use lnd_rs::transport::mailbox::MailboxTransport;
-use lnd_rs::{config::LncConfig, credentials::InMemoryCredentialStore, Lnc};
+use lnd_rs::{
+    config::LncConfig,
+    credentials::{CredentialStore, InMemoryCredentialStore},
+    Lnc,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pairing_phrase = std::env::args().nth(1).expect("pass 10-word pairing phrase");
 
-    let transport = MailboxTransport::new(None);
-    let mut lnc = Lnc::with_config(transport, LncConfig::default());
+    let config = LncConfig::default();
+    let transport = MailboxTransport::with_mailbox_config(
+        config.server_host.clone(), config.mailbox.clone(),
+    );
+    let mut lnc = Lnc::with_config(transport, config);
 
     // First run: pair and persist
     let creds = lnc.pair_node(&pairing_phrase).await?;
@@ -96,8 +103,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Mailbox notes
 - Requires `resources/aezeed_words_english.txt` (included here) for the AEZEED dictionary.
-- Pairing performs Noise + WSS + HTTP/2 handshakes; expensive steps are offloaded via
-  `tokio::task::spawn_blocking` to avoid blocking the runtime.
+- Pairing performs Noise + WSS + HTTP/2 handshakes. AEZEED scrypt uses one
+  process-owned worker with one queued request; caller cancellation skips queued
+  work and discards active results. The blocking Noise I/O bridge runs on the
+  caller's Tokio blocking pool and cancels its reads/writes when the async
+  handshake owner is dropped.
 
 Troubleshooting
 - Proto build not running: ensure a `protos/lnd/<tag>/lightning.proto` exists or set `LND_TAG`.

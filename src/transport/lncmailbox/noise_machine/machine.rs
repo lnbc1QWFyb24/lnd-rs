@@ -221,8 +221,6 @@ impl HandshakeState {
                     trace!(
                         target: "lnd_rs::mailbox::noise::act1",
                         version = self.version,
-                        unmasked_ephemeral = %hex::encode(encoded.as_bytes()),
-                        masked_ephemeral = %hex::encode(masked.to_encoded_point(true).as_bytes()),
                         "prepared masked ephemeral"
                     );
                     out.extend_from_slice(masked.to_encoded_point(true).as_bytes());
@@ -245,9 +243,6 @@ impl HandshakeState {
                     self.symmetric.mix_key(&secret)?;
                     trace!(
                         target: "lnd_rs::mailbox::noise::act2",
-                        chaining_key = %hex::encode(self.symmetric.chaining_key),
-                        temp_key = %hex::encode(self.symmetric.temp_key),
-                        handshake_digest = %hex::encode(self.symmetric.handshake_digest),
                         "after EE mix_key (write)"
                     );
                 }
@@ -436,7 +431,6 @@ impl HandshakeState {
         self.remote_ephemeral = Some(pk);
         trace!(
             target: "lnd_rs::mailbox::noise::act2",
-            remote_ephemeral = %hex::encode(encoded.as_bytes()),
             "read remote ephemeral"
         );
         Ok(())
@@ -459,8 +453,6 @@ impl HandshakeState {
         reader.read_exact(&mut buf)?;
         trace!(
             target: "lnd_rs::mailbox::noise::act2",
-            ciphertext = %hex::encode(&buf),
-            handshake_digest = %hex::encode(self.symmetric.handshake_digest),
             "received encrypted static key"
         );
         let plaintext = self.symmetric.decrypt_and_hash(&buf)?;
@@ -469,7 +461,6 @@ impl HandshakeState {
         self.remote_static = Some(pk);
         trace!(
             target: "lnd_rs::mailbox::noise::act2",
-            remote_static = %hex::encode(&plaintext),
             "decrypted remote static key"
         );
         Ok(())
@@ -488,9 +479,6 @@ impl HandshakeState {
         self.symmetric.mix_key(&secret)?;
         trace!(
             target: "lnd_rs::mailbox::noise::act2",
-            chaining_key = %hex::encode(self.symmetric.chaining_key),
-            temp_key = %hex::encode(self.symmetric.temp_key),
-            handshake_digest = %hex::encode(self.symmetric.handshake_digest),
             "after EE mix_key (read)"
         );
         Ok(())
@@ -828,6 +816,9 @@ mod tests {
     #[test]
     #[serial]
     fn xx_handshake_roundtrip_and_message() {
+        let (dispatch, traces) = crate::test_support::trace_capture();
+        let _trace_guard = tracing::dispatcher::set_default(&dispatch);
+        let server_dispatch = dispatch.clone();
         let (mut client_stream, mut server_stream) = InMemoryStream::pair();
         let client_sk = Arc::new(SecretKey::random(&mut OsRng));
         let server_sk = Arc::new(SecretKey::random(&mut OsRng));
@@ -873,6 +864,7 @@ mod tests {
 
         let mut client_machine = BrontideMachine::new(client_cfg).expect("client machine");
         let server_handle = thread::spawn(move || {
+            let _trace_guard = tracing::dispatcher::set_default(&server_dispatch);
             let mut machine = BrontideMachine::new(server_cfg).expect("server machine");
             machine
                 .do_handshake(&mut server_stream)
@@ -907,6 +899,15 @@ mod tests {
             .read_message(&mut server_stream)
             .expect("read message");
         assert_eq!(plaintext, b"hello");
+        let output = String::from_utf8(traces.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("negotiated handshake version"));
+        assert!(!output.contains("macaroon-data"));
+        assert!(
+            !output
+                .split(|ch: char| !ch.is_ascii_hexdigit())
+                .any(|word| word.len() >= 64),
+            "cryptographic key material reached tracing"
+        );
     }
 
     #[test]

@@ -2,16 +2,8 @@
 
 //! Core mailbox connection metadata shared by the WS/GBN layers.
 
-use std::{
-    fmt,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{fmt, sync::Arc, time::Duration};
 
-use base64::Engine as _;
 use bytes::{BufMut, Bytes};
 use parking_lot::Mutex;
 use tokio::{
@@ -23,7 +15,8 @@ use tracing::{debug, trace};
 
 use super::{
     gbn::{GoBackNConn, GoBackNConnError, GoBackNOptions},
-    ws::{mailbox_pair, MailboxRecv, MailboxSend, WsError, WsTimeouts},
+    receive_budget::{ReceiveBudget, RECEIVE_CAPACITY, SOCKET_SCRATCH},
+    ws::{mailbox_pair_with_tls_config, MailboxRecv, MailboxSend, WsError, WsTimeouts},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -47,10 +40,14 @@ impl fmt::Display for ClientStatus {
 }
 
 /// Control frames exchanged with the hashmail service.
+///
+/// Received payloads retain their connection's receive-memory reservation.
+/// Clones and slices share that reservation until the last owner is dropped;
+/// use an explicit copy only when independently owned data is required.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlMsg {
     pub version: u8,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
 }
 
 impl ControlMsg {
@@ -95,7 +92,20 @@ impl ControlMsg {
         }
         Ok(Self {
             version,
-            payload: buf[5..].to_vec(),
+            payload: Bytes::copy_from_slice(&buf[5..]),
+        })
+    }
+    fn decode_shared(buf: &Bytes) -> Result<Self, String> {
+        if buf.len() < 5 {
+            return Err("control message too short".into());
+        }
+        let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+        if buf.len() - 5 != len {
+            return Err("control message length mismatch".into());
+        }
+        Ok(Self {
+            version: buf[0],
+            payload: buf.slice(5..),
         })
     }
 }
@@ -137,15 +147,33 @@ pub struct ClientConnParams {
     pub retry_wait: Duration,
     /// Websocket timeouts enforced on connect/send operations.
     pub timeouts: WsTimeouts,
+    /// Optional caller-resolved address shared by both streams and reconnects.
+    pub resolved_address: Option<std::net::SocketAddr>,
+    /// Caller-owned TLS policy; `None` retains bundled Web PKI validation.
+    pub tls_config: Option<Arc<rustls::ClientConfig>>,
 }
 
 pub struct ClientConn {
     gbn: Arc<GoBackNConn>,
     status: Arc<StatusHub>,
     shutdown: watch::Sender<bool>,
-    send_task: JoinHandle<()>,
-    recv_task: JoinHandle<()>,
-    act1_logged: AtomicBool,
+    send_task: ConnectionTask,
+    recv_task: ConnectionTask,
+}
+
+/// Keeps partially established websocket tasks owned during cancellation.
+struct ConnectionTask(JoinHandle<()>);
+
+impl ConnectionTask {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for ConnectionTask {
+    fn drop(&mut self) {
+        self.abort();
+    }
 }
 
 impl ClientConn {
@@ -163,37 +191,40 @@ impl ClientConn {
             gbn_opts,
             retry_wait,
             timeouts,
+            resolved_address,
+            tls_config,
         } = params;
         debug!(
             target: "lnd_rs::mailbox::conn",
-            host = server_host,
-            recv_sid_prefix = %hex::encode(&recv_sid[..4]),
-            send_sid_prefix = %hex::encode(&send_sid[..4]),
             "ClientConn::connect start"
         );
         let capacity = gbn_opts.window_size.max(1) as usize * 4;
         let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(capacity);
-        let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(capacity);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(capacity);
 
         let status = StatusHub::new();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let budget = ReceiveBudget::new(RECEIVE_CAPACITY, shutdown_tx.clone());
+        let scratch = budget
+            .reserve(SOCKET_SCRATCH)
+            .map_err(|()| ClientConnError::Protocol("receive retention budget exceeded".into()))?;
 
-        let (mut recv_ws, send_ws) = mailbox_pair(
+        let (mut recv_ws, send_ws) = mailbox_pair_with_tls_config(
             server_host.to_string(),
             recv_sid.to_vec(),
             send_sid.to_vec(),
             timeouts,
+            resolved_address,
+            tls_config,
         );
 
         // Ensure the receive stream is connected and initialized before any
         // outbound frames (like the initial GBN SYN) are sent. This mirrors
         // the Go client order and prevents a race where the server hasn't
         // yet created the receive stream, leading to "stream not found".
-        if let Err(err) = recv_ws.ensure_connected().await {
+        if recv_ws.ensure_connected().await.is_err() {
             debug!(
                 target: "lnd_rs::mailbox::conn",
-                error = %err,
-                hint = %err.status_hint(),
                 "eager recv ensure_connected error"
             );
             // We'll proceed; the recv loop will keep retrying.
@@ -204,7 +235,7 @@ impl ClientConn {
         let send_shutdown = shutdown_rx.clone();
         let send_status = status.clone();
         let send_retry_wait = retry_wait;
-        let send_task = tokio::spawn(async move {
+        let send_task = ConnectionTask(tokio::spawn(async move {
             trace!(target: "lnd_rs::mailbox::conn", "send_loop spawned");
             send_loop(
                 send_ws,
@@ -215,12 +246,16 @@ impl ClientConn {
             )
             .await;
             trace!(target: "lnd_rs::mailbox::conn", "send_loop exited");
-        });
+        }));
 
         let recv_shutdown = shutdown_rx.clone();
         let recv_status = status.clone();
         let recv_retry_wait = retry_wait;
-        let recv_task = tokio::spawn(async move {
+        let recv_budget = budget.clone();
+        let recv_task = ConnectionTask(tokio::spawn(async move {
+            // Socket buffers can retain capacity between reads, so this lease
+            // spans the entire socket lifetime, including reconnection.
+            let _scratch = scratch;
             trace!(target: "lnd_rs::mailbox::conn", "recv_loop spawned");
             recv_loop(
                 recv_ws,
@@ -228,24 +263,26 @@ impl ClientConn {
                 recv_status,
                 recv_shutdown,
                 recv_retry_wait,
+                recv_budget,
             )
             .await;
             trace!(target: "lnd_rs::mailbox::conn", "recv_loop exited");
-        });
+        }));
 
         debug!(target: "lnd_rs::mailbox::conn", "WS tasks spawned; starting GBN handshake");
 
         // Now build the GBN connection which will send SYN immediately. The
         // send/recv loops are active to carry handshake frames.
-        let gbn = match GoBackNConn::connect(gbn_opts, outbound_tx, inbound_rx).await {
-            Ok(g) => g,
-            Err(e) => {
-                let _ = shutdown_tx.send(true);
-                send_task.abort();
-                recv_task.abort();
-                return Err(ClientConnError::from(e));
-            }
-        };
+        let gbn =
+            match GoBackNConn::connect_budgeted(gbn_opts, outbound_tx, inbound_rx, budget).await {
+                Ok(g) => g,
+                Err(e) => {
+                    let _ = shutdown_tx.send(true);
+                    send_task.abort();
+                    recv_task.abort();
+                    return Err(ClientConnError::from(e));
+                }
+            };
         let gbn = Arc::new(gbn);
 
         debug!(target: "lnd_rs::mailbox::conn", "ClientConn::connect done (GBN ready)");
@@ -255,7 +292,6 @@ impl ClientConn {
             shutdown: shutdown_tx,
             send_task,
             recv_task,
-            act1_logged: AtomicBool::new(false),
         })
     }
 
@@ -284,12 +320,16 @@ impl ClientConn {
 
     /// Receive the next control message from the mailbox transport.
     ///
+    /// The complete control is bounded to 64 MiB and 65,536 fragments. Queue,
+    /// fragment and assembly-copy capacity share one admission budget; exhausted
+    /// admission terminates the session without waiting or reconnecting.
+    ///
     /// # Errors
     /// Returns a [`ClientConnError`] when the underlying connection closes or the message cannot be
     /// decoded.
     pub async fn receive_control_msg(&self) -> Result<ControlMsg, ClientConnError> {
         let payload = self.gbn.recv().await.map_err(ClientConnError::from)?;
-        ControlMsg::decode(&payload).map_err(ClientConnError::Protocol)
+        ControlMsg::decode_shared(&payload).map_err(ClientConnError::Protocol)
     }
 
     /// Send a control message to the remote mailbox peer.
@@ -297,20 +337,6 @@ impl ClientConn {
     /// # Errors
     /// Returns a [`ClientConnError`] when the framed send fails.
     pub async fn send_control_msg(&self, msg: &ControlMsg) -> Result<(), ClientConnError> {
-        if !self.act1_logged.swap(true, Ordering::SeqCst) {
-            let payload = &msg.payload;
-            let ver = msg.version;
-            let len = msg.len();
-            let preview_len = payload.len().min(64);
-            let preview = base64::engine::general_purpose::STANDARD.encode(&payload[..preview_len]);
-            debug!(
-                target: "lnd_rs::mailbox::conn",
-                ctl_ver = ver,
-                ctl_len = len,
-                payload_b64_prefix = %preview,
-                "act1 control send"
-            );
-        }
         self.gbn
             .send_frame(Bytes::from(msg.encode()))
             .await
@@ -319,9 +345,16 @@ impl ClientConn {
 
     pub async fn close(&self) {
         let _ = self.shutdown.send(true);
-        let _ = self.gbn.close().await;
         self.send_task.abort();
         self.recv_task.abort();
+        self.gbn.discard_received().await;
+    }
+
+    pub(super) async fn wait_for_shutdown(&self) {
+        let mut shutdown = self.shutdown.subscribe();
+        if !*shutdown.borrow() {
+            let _ = shutdown.changed().await;
+        }
     }
 }
 
@@ -389,7 +422,7 @@ async fn send_loop(
                 return;
             }
             if let Err(err) = socket.ensure_connected().await {
-                debug!(target: "lnd_rs::mailbox::conn", error = %err, "send ensure_connected error");
+                debug!(target: "lnd_rs::mailbox::conn", "send ensure_connected error");
                 status.set(status_from_ws_error(&err));
                 if wait_retry(&mut shutdown, retry_wait).await {
                     return;
@@ -403,7 +436,7 @@ async fn send_loop(
                     break;
                 }
                 Err(err) => {
-                    debug!(target: "lnd_rs::mailbox::conn", error = %err, "send error");
+                    debug!(target: "lnd_rs::mailbox::conn", "send error");
                     let mapped = status_from_ws_error(&err);
                     status.set(mapped);
                     // Retry on all errors to mirror Go client behavior.
@@ -419,10 +452,11 @@ async fn send_loop(
 
 async fn recv_loop(
     mut socket: MailboxRecv,
-    inbound_tx: mpsc::Sender<Vec<u8>>,
+    inbound_tx: mpsc::Sender<Bytes>,
     status: Arc<StatusHub>,
     mut shutdown: watch::Receiver<bool>,
     retry_wait: Duration,
+    budget: ReceiveBudget,
 ) {
     debug!(target: "lnd_rs::mailbox::conn", "recv_loop start");
     loop {
@@ -433,7 +467,7 @@ async fn recv_loop(
         if !socket.is_connected() {
             trace!(target: "lnd_rs::mailbox::conn", "recv ensure_connected attempting");
             if let Err(err) = socket.ensure_connected().await {
-                debug!(target: "lnd_rs::mailbox::conn", error = %err, hint = %err.status_hint(), "recv ensure_connected error");
+                debug!(target: "lnd_rs::mailbox::conn", "recv ensure_connected error");
                 status.set(status_from_ws_error(&err));
                 if wait_retry(&mut shutdown, retry_wait).await {
                     return;
@@ -443,7 +477,12 @@ async fn recv_loop(
             trace!(target: "lnd_rs::mailbox::conn", "recv ensure_connected ok");
         }
 
-        match socket.recv().await {
+        let received = tokio::select! {
+            biased;
+            () = budget.closed() => return,
+            result = socket.recv_budgeted(&budget) => result,
+        };
+        match received {
             Ok(frame) => {
                 status.set(ClientStatus::Connected);
                 trace!(target: "lnd_rs::mailbox::conn", bytes = frame.len(), "recv_loop got frame");
@@ -454,8 +493,12 @@ async fn recv_loop(
                     return;
                 }
             }
+            Err(WsError::ReceiveLimit) => {
+                status.set(ClientStatus::NotConnected);
+                return;
+            }
             Err(err) => {
-                debug!(target: "lnd_rs::mailbox::conn", error = %err, hint = %err.status_hint(), "recv error");
+                debug!(target: "lnd_rs::mailbox::conn", "recv error");
                 let mapped = status_from_ws_error(&err);
                 status.set(mapped);
                 // Always retry creating/connecting the receive stream; even
@@ -488,9 +531,9 @@ async fn recv_with_shutdown<T>(
     }
 }
 
-async fn send_with_shutdown(
-    tx: &mpsc::Sender<Vec<u8>>,
-    data: Vec<u8>,
+async fn send_with_shutdown<T>(
+    tx: &mpsc::Sender<T>,
+    data: T,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), ()> {
     tokio::select! {
@@ -510,11 +553,28 @@ async fn wait_retry(shutdown: &mut watch::Receiver<bool>, delay: Duration) -> bo
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn dropping_partial_connection_releases_background_tasks() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (released_tx, released_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = ConnectionTask(tokio::spawn(async move {
+            let _resource = released_tx;
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.unwrap();
+        drop(task);
+        assert!(tokio::time::timeout(Duration::from_secs(1), released_rx)
+            .await
+            .expect("cancelled setup must release task")
+            .is_err());
+    }
+
     #[test]
     fn control_message_roundtrip() {
         let msg = ControlMsg {
             version: 2,
-            payload: b"hello".to_vec(),
+            payload: Bytes::from_static(b"hello"),
         };
         let enc = msg.encode();
         let dec = ControlMsg::decode(&enc).expect("decode");
@@ -534,3 +594,7 @@ mod tests {
         assert_eq!(status_from_error("oops"), ClientStatus::NotConnected);
     }
 }
+
+#[cfg(test)]
+#[path = "conn/receive_tests.rs"]
+mod receive_tests;

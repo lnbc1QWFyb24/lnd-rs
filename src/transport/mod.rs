@@ -122,6 +122,7 @@ pub mod lncmailbox {
     pub mod noise_conn;
     pub mod noise_machine;
     pub mod noise_pattern;
+    mod receive_budget;
     pub mod sid;
     pub mod ws;
 }

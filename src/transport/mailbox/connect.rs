@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use base64::Engine;
+use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::{elliptic_curve::rand_core::OsRng, PublicKey, SecretKey};
 use parking_lot::Mutex;
-use tracing::{debug, trace};
+use tracing::debug;
 
 use crate::transport::lncmailbox::{
-    aezeed, crypto,
+    aezeed,
     noise::{HANDSHAKE_VERSION0, HANDSHAKE_VERSION2},
     noise_machine::{BrontideMachineConfig, PatternRef},
     sid,
@@ -25,84 +25,32 @@ impl MailboxConnectContext {
     /// Build a connection context from pairing inputs.
     ///
     /// When performing an XX handshake (no remote static key provided), this spawns a blocking
-    /// scrypt stretch in a background thread to avoid blocking the async runtime.
+    /// scrypt stretch on a bounded process-owned worker. Dropping the future
+    /// never makes shutdown of the caller's async runtime wait for this work.
     pub async fn new_async(
-        server_host: &str,
+        _server_host: &str,
         pairing_phrase: &str,
         local_key_hex: &str,
         remote_key_hex: &str,
     ) -> Result<Self, TransportError> {
         debug!(
             target: "lnd_rs::mailbox",
-            server_host = %server_host,
             local_key_len = local_key_hex.len(),
             remote_key_len = remote_key_hex.len(),
             has_remote = !remote_key_hex.is_empty(),
             "transport.connect"
         );
-        let words: Vec<String> = pairing_phrase
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
-        let entropy14 = aezeed::mnemonic_to_entropy(&words).map_err(|e| {
-            TransportError::connection_message(format!("invalid pairing phrase: {e}"))
-        })?;
-
-        let local_sk = if local_key_hex.is_empty() {
-            SecretKey::random(&mut OsRng)
-        } else {
-            SecretKey::from_slice(
-                &hex::decode(local_key_hex)
-                    .map_err(|e| TransportError::connection("invalid local key hex", e))?,
-            )
-            .map_err(|e| TransportError::connection("invalid local key bytes", e))?
-        };
-
-        let remote_pk = if remote_key_hex.is_empty() {
-            None
-        } else {
-            let bytes = hex::decode(remote_key_hex)
-                .map_err(|e| TransportError::connection("invalid remote key hex", e))?;
-            Some(
-                PublicKey::from_sec1_bytes(&bytes)
-                    .map_err(|e| TransportError::connection("invalid remote key bytes", e))?,
-            )
-        };
+        check_material_lengths(pairing_phrase, local_key_hex, remote_key_hex)?;
+        let entropy14 = parse_phrase(pairing_phrase)?;
+        let local_sk =
+            parse_local_key(local_key_hex)?.unwrap_or_else(|| SecretKey::random(&mut OsRng));
+        let remote_pk = parse_remote_key(remote_key_hex)?;
 
         let sid_val = sid::derive_sid(&entropy14, &local_sk, remote_pk.as_ref());
         let (recv_sid, send_sid) = sid::sid_stream_ids(sid_val);
-        trace!(
-            target: "lnd_rs::mailbox::sid",
-            recv_prefix = %hex::encode(&recv_sid[..4]),
-            send_prefix = %hex::encode(&send_sid[..4]),
-            pattern = %if remote_pk.is_some() { "KK" } else { "XX" },
-            "derived SID prefixes"
-        );
-        trace!(
-            target: "lnd_rs::mailbox::sid",
-            recv_sid = %base64::engine::general_purpose::STANDARD.encode(recv_sid),
-            send_sid = %base64::engine::general_purpose::STANDARD.encode(send_sid),
-            "derived SID values"
-        );
-
         let entropy_vec = entropy14.to_vec();
         let passphrase_entropy = if remote_pk.is_none() {
-            let entropy_clone = entropy_vec.clone();
-            // Offload the CPU-heavy scrypt to a blocking thread.
-            let stretched =
-                tokio::task::spawn_blocking(move || crypto::scrypt_stretch(&entropy_clone))
-                    .await
-                    .map_err(|e| TransportError::connection("scrypt task join failed", e))?
-                    .map_err(|e| {
-                        TransportError::connection_message(format!(
-                            "passphrase stretch failed: {e}"
-                        ))
-                    })?;
-            trace!(
-                target: "lnd_rs::mailbox",
-                stretch_hex = %hex::encode(&stretched),
-                "XX passphrase stretch (32b)"
-            );
+            let stretched = super::stretch::pairing_entropy(entropy_vec.clone()).await?;
             Arc::new(stretched)
         } else {
             Arc::new(entropy_vec.clone())
@@ -125,6 +73,111 @@ impl MailboxConnectContext {
             builder,
         })
     }
+}
+
+const MAX_PAIRING_FIELD_BYTES: usize = 4096;
+
+pub(super) fn validate_pairing_material(
+    pairing_phrase: &str,
+    local_key_hex: &str,
+    remote_key_hex: &str,
+) -> Result<(), TransportError> {
+    check_material_lengths(pairing_phrase, local_key_hex, remote_key_hex)?;
+    parse_phrase(pairing_phrase)?;
+    parse_local_key(local_key_hex)?;
+    parse_remote_key(remote_key_hex)?;
+    Ok(())
+}
+
+/// Commit to semantic pairing inputs without stretching entropy or doing I/O.
+pub(super) fn pairing_commitment(
+    authority: &str,
+    pairing_phrase: &str,
+    local_key_hex: &str,
+    remote_key_hex: &str,
+) -> Result<[u8; 32], TransportError> {
+    use sha2::{Digest, Sha256};
+
+    if authority.is_empty() || authority.len() > 320 || !authority.is_ascii() {
+        return Err(TransportError::connection_message(
+            "invalid pairing authority",
+        ));
+    }
+    check_material_lengths(pairing_phrase, local_key_hex, remote_key_hex)?;
+    let entropy = parse_phrase(pairing_phrase)?;
+    let local = parse_local_key(local_key_hex)?.ok_or_else(|| {
+        TransportError::connection_message("local key required for pairing commitment")
+    })?;
+    let remote = parse_remote_key(remote_key_hex)?;
+    let encoded_remote = remote.map(|key| key.to_encoded_point(true));
+    let mut digest = Sha256::new();
+    digest.update(b"lnd-rs:lnc-pairing-commitment:v1\0");
+    let local_bytes = local.to_bytes();
+    let mode = [u8::from(encoded_remote.is_some())];
+    for field in [
+        authority.as_bytes(),
+        &entropy,
+        local_bytes.as_slice(),
+        &mode,
+        encoded_remote
+            .as_ref()
+            .map_or(&[][..], |key| key.as_bytes()),
+    ] {
+        // Inputs have fixed or validated bounds of at most 4096 bytes.
+        let length = u64::try_from(field.len()).map_err(|_| {
+            TransportError::connection_message("pairing commitment field exceeds byte limit")
+        })?;
+        digest.update(length.to_be_bytes());
+        digest.update(field);
+    }
+    Ok(digest.finalize().into())
+}
+
+fn check_material_lengths(
+    pairing_phrase: &str,
+    local_key_hex: &str,
+    remote_key_hex: &str,
+) -> Result<(), TransportError> {
+    if [pairing_phrase, local_key_hex, remote_key_hex]
+        .iter()
+        .any(|field| field.len() > MAX_PAIRING_FIELD_BYTES)
+    {
+        return Err(TransportError::connection_message(
+            "pairing material field exceeds byte limit",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_phrase(pairing_phrase: &str) -> Result<[u8; 14], TransportError> {
+    let words: Vec<String> = pairing_phrase
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    aezeed::mnemonic_to_entropy(&words)
+        .map_err(|_| TransportError::connection_message("invalid pairing phrase"))
+}
+
+fn parse_local_key(local_key_hex: &str) -> Result<Option<SecretKey>, TransportError> {
+    if local_key_hex.is_empty() {
+        return Ok(None);
+    }
+    let bytes = hex::decode(local_key_hex)
+        .map_err(|_| TransportError::connection_message("invalid local key hex"))?;
+    SecretKey::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| TransportError::connection_message("invalid local key bytes"))
+}
+
+fn parse_remote_key(remote_key_hex: &str) -> Result<Option<PublicKey>, TransportError> {
+    if remote_key_hex.is_empty() {
+        return Ok(None);
+    }
+    let bytes = hex::decode(remote_key_hex)
+        .map_err(|_| TransportError::connection_message("invalid remote key hex"))?;
+    PublicKey::from_sec1_bytes(&bytes)
+        .map(Some)
+        .map_err(|_| TransportError::connection_message("invalid remote key bytes"))
 }
 
 #[derive(Clone)]

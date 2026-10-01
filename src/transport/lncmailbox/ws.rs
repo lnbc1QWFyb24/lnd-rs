@@ -1,14 +1,21 @@
 #![cfg(feature = "transport-mailbox")]
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use futures_util::SinkExt;
+use serde::Serialize;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
-use tracing::{debug, trace};
+use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tracing::debug;
+
+mod connect;
+mod envelope;
+mod receive;
+
+#[cfg(test)]
+use envelope::decode_cipher_box;
 
 const RECEIVE_PATH: &str = "/v1/lightning-node-connect/hashmail/receive?method=POST";
 const SEND_PATH: &str = "/v1/lightning-node-connect/hashmail/send?method=POST";
@@ -30,6 +37,8 @@ impl WsTimeouts {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WsError {
+    #[error("receive retention budget exceeded")]
+    ReceiveLimit,
     #[error("websocket closed")]
     Closed,
     #[error("transport error: {0}")]
@@ -56,6 +65,8 @@ pub struct MailboxRecv {
     stream_id: Vec<u8>,
     socket: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     timeouts: WsTimeouts,
+    resolved_address: Option<std::net::SocketAddr>,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
 }
 
 /// Client-side send stream bound to the hashmail `/send` endpoint.
@@ -64,6 +75,8 @@ pub struct MailboxSend {
     stream_id: Vec<u8>,
     socket: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     timeouts: WsTimeouts,
+    resolved_address: Option<std::net::SocketAddr>,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
 }
 
 /// Build paired websocket send/receive handles for the provided stream identifiers.
@@ -73,6 +86,32 @@ pub fn mailbox_pair(
     send_sid: Vec<u8>,
     timeouts: WsTimeouts,
 ) -> (MailboxRecv, MailboxSend) {
+    mailbox_pair_with_resolved_address(addr, recv_sid, send_sid, timeouts, None)
+}
+
+/// Build streams using one caller-resolved address for every connection attempt.
+///
+/// The original authority is retained for TLS and HTTP. No additional DNS work
+/// occurs when an address is supplied; the caller owns resolution and refresh.
+pub fn mailbox_pair_with_resolved_address(
+    addr: impl Into<String>,
+    recv_sid: Vec<u8>,
+    send_sid: Vec<u8>,
+    timeouts: WsTimeouts,
+    resolved_address: Option<std::net::SocketAddr>,
+) -> (MailboxRecv, MailboxSend) {
+    mailbox_pair_with_tls_config(addr, recv_sid, send_sid, timeouts, resolved_address, None)
+}
+
+/// Shared construction keeps caller TLS policy identical on both streams.
+pub(crate) fn mailbox_pair_with_tls_config(
+    addr: impl Into<String>,
+    recv_sid: Vec<u8>,
+    send_sid: Vec<u8>,
+    timeouts: WsTimeouts,
+    resolved_address: Option<std::net::SocketAddr>,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+) -> (MailboxRecv, MailboxSend) {
     let addr = addr.into();
     (
         MailboxRecv {
@@ -80,101 +119,18 @@ pub fn mailbox_pair(
             stream_id: recv_sid,
             socket: None,
             timeouts,
+            resolved_address,
+            tls_config: tls_config.clone(),
         },
         MailboxSend {
             addr,
             stream_id: send_sid,
             socket: None,
             timeouts,
+            resolved_address,
+            tls_config,
         },
     )
-}
-
-impl MailboxRecv {
-    pub fn is_connected(&self) -> bool {
-        self.socket.is_some()
-    }
-
-    /// Establish the websocket connection if it is not already active.
-    ///
-    /// # Errors
-    /// Returns a [`WsError`] when the underlying websocket connect or initialization fails.
-    #[allow(unused_mut)]
-    pub async fn ensure_connected(&mut self) -> Result<(), WsError> {
-        if self.socket.is_some() {
-            return Ok(());
-        }
-        let url = format!("wss://{}{}", self.addr, RECEIVE_PATH);
-        debug!(target: "lnd_rs::mailbox::ws", %url, "recv connecting");
-        #[allow(unused_mut)]
-        let (mut ws, _) = match timeout(self.timeouts.connect, connect_async(&url)).await {
-            Ok(Ok(tuple)) => tuple,
-            Ok(Err(e)) => return Err(WsError::Transport(e.to_string())),
-            Err(_) => return Err(WsError::Transport("receive connect timeout".into())),
-        };
-        debug!(target: "lnd_rs::mailbox::ws", "recv connected");
-        let _ = ws.get_mut();
-
-        let init = build_desc(&self.stream_id)?;
-        trace!(
-            target: "lnd_rs::mailbox::ws",
-            init_json = %init,
-            stream_id_b64 = %base64::engine::general_purpose::STANDARD.encode(&self.stream_id),
-            "recv init"
-        );
-        let _ = ws.get_mut();
-        let send_fut = ws.send(Message::Text(init.into()));
-        timeout(self.timeouts.send, send_fut)
-            .await
-            .map_err(|_| WsError::Transport("receive init timeout".into()))?
-            .map_err(|e| WsError::Transport(e.to_string()))?;
-        debug!(target: "lnd_rs::mailbox::ws", "recv sent init");
-
-        self.socket = Some(ws);
-        Ok(())
-    }
-
-    /// Receive the next payload from the mailbox stream.
-    ///
-    /// # Errors
-    /// Returns a [`WsError`] when the websocket closes, the server reports an error, or the
-    /// payload cannot be decoded.
-    pub async fn recv(&mut self) -> Result<Vec<u8>, WsError> {
-        loop {
-            let socket = self
-                .socket
-                .as_mut()
-                .ok_or_else(|| WsError::Transport("receive socket not connected".into()))?;
-            match socket.next().await {
-                Some(Ok(Message::Text(txt))) => {
-                    let unwrapped = strip_json_wrapper(&txt)?;
-                    let msg = parse_cipher_box(&unwrapped)?;
-                    return Ok(msg);
-                }
-                Some(Ok(Message::Binary(data))) => return Ok(data.to_vec()),
-                Some(Ok(Message::Ping(payload))) => {
-                    let _ = socket.send(Message::Pong(payload)).await;
-                }
-                Some(Ok(Message::Close(_))) | None => {
-                    debug!(target: "lnd_rs::mailbox::ws", "recv socket closed; reconnecting");
-                    self.socket = None;
-                    return Err(WsError::Closed);
-                }
-                Some(Err(err)) => {
-                    debug!(target: "lnd_rs::mailbox::ws", error = %err, "recv socket error; reconnecting");
-                    self.socket = None;
-                    return Err(WsError::Transport(err.to_string()));
-                }
-                Some(Ok(_)) => {}
-            }
-        }
-    }
-
-    pub async fn close(&mut self) {
-        if let Some(mut socket) = self.socket.take() {
-            let _ = socket.close(None).await;
-        }
-    }
 }
 
 impl MailboxSend {
@@ -186,16 +142,19 @@ impl MailboxSend {
     ///
     /// # Errors
     /// Returns a [`WsError`] when connecting to the hashmail server fails.
-    #[allow(unused_mut)]
     pub async fn ensure_connected(&mut self) -> Result<(), WsError> {
         if self.socket.is_some() {
             return Ok(());
         }
         let url = format!("wss://{}{}", self.addr, SEND_PATH);
-        debug!(target: "lnd_rs::mailbox::ws", %url, "send connecting");
-        #[allow(unused_mut)]
-        let (mut ws, _) = match timeout(self.timeouts.connect, connect_async(&url)).await {
-            Ok(Ok(tuple)) => tuple,
+        debug!(target: "lnd_rs::mailbox::ws", "send connecting");
+        let ws = match timeout(
+            self.timeouts.connect,
+            connect::open(&url, self.resolved_address, self.tls_config.clone()),
+        )
+        .await
+        {
+            Ok(Ok(socket)) => socket,
             Ok(Err(e)) => return Err(WsError::Transport(e.to_string())),
             Err(_) => return Err(WsError::Transport("send connect timeout".into())),
         };
@@ -214,21 +173,11 @@ impl MailboxSend {
             .as_mut()
             .ok_or_else(|| WsError::Transport("send socket not connected".into()))?;
         let boxed = build_cipher_box(&self.stream_id, payload)?;
-        // Log the stream_id to verify it's correct
-        trace!(
-            target: "lnd_rs::mailbox::ws",
-            stream_id_b64 = %base64::engine::general_purpose::STANDARD.encode(&self.stream_id),
-            "send target"
-        );
-        // For small control frames (e.g. SYN/SYNACK/ACK/NACK), log the full JSON payload.
-        if payload.len() <= 8 {
-            trace!(target: "lnd_rs::mailbox::ws", payload_json = %boxed, "send small payload");
-        }
         let send_fut = socket.send(Message::Text(boxed.into()));
         match timeout(self.timeouts.send, send_fut).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err)) => {
-                debug!(target: "lnd_rs::mailbox::ws", error = %err, "send socket error; reconnecting");
+                debug!(target: "lnd_rs::mailbox::ws", "send socket error; reconnecting");
                 self.socket = None;
                 Err(WsError::Transport(err.to_string()))
             }
@@ -260,12 +209,6 @@ struct CipherBox<'a> {
     msg: &'a str,
 }
 
-#[derive(Deserialize)]
-struct CipherBoxResp {
-    #[serde(rename = "msg")]
-    msg: String,
-}
-
 fn build_desc(stream_id: &[u8]) -> Result<String, WsError> {
     let sid = STANDARD.encode(stream_id);
     // Use proto JSON field name `stream_id` to match the server.
@@ -283,51 +226,34 @@ fn build_cipher_box(stream_id: &[u8], payload: &[u8]) -> Result<String, WsError>
     .map_err(|e| WsError::Decode(e.to_string()))
 }
 
-fn parse_cipher_box(inner: &str) -> Result<Vec<u8>, WsError> {
-    let parsed: CipherBoxResp =
-        serde_json::from_str(inner).map_err(|e| WsError::Decode(e.to_string()))?;
-    STANDARD
-        .decode(parsed.msg.as_bytes())
-        .map_err(|e| WsError::Decode(e.to_string()))
-}
-
-fn strip_json_wrapper(wrapped: &str) -> Result<String, WsError> {
-    let value: serde_json::Value =
-        serde_json::from_str(wrapped).map_err(|e| WsError::Decode(e.to_string()))?;
-    match value {
-        serde_json::Value::Object(mut map) => {
-            if let Some(result) = map.remove("result") {
-                serde_json::to_string(&result).map_err(|e| WsError::Decode(e.to_string()))
-            } else if let Some(err) = map.remove("error") {
-                let err_str = err
-                    .as_str()
-                    .map(str::to_string)
-                    .or_else(|| serde_json::to_string(&err).ok())
-                    .unwrap_or_else(|| "unknown mailbox error".to_string());
-                Err(WsError::Server(err_str))
-            } else {
-                Err(WsError::Decode("missing result/error fields".into()))
-            }
-        }
-        _ => Err(WsError::Decode("unexpected JSON envelope".into())),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn strip_wrapper_success() {
+    fn typed_wrapper_preserves_ciphertext_and_skips_unused_fields() {
         let raw = r#"{"result":{"msg":"aGVsbG8="}}"#;
-        let inner = strip_json_wrapper(raw).expect("unwrap");
-        assert_eq!(inner, r#"{"msg":"aGVsbG8="}"#);
+        assert_eq!(decode_cipher_box(raw).unwrap(), b"hello");
+        let extended = r#"{"ignored":[0,{"nested":true}],"result":{"desc":{"stream_id":"unused"},"extra":[1,2,3],"msg":"aGVsbG8="}}"#;
+        assert_eq!(decode_cipher_box(extended).unwrap(), b"hello");
+        let escaped = r#"{"result":{"msg":"aGVsbG8\u003d"}}"#;
+        assert_eq!(decode_cipher_box(escaped).unwrap(), b"hello");
+        for invalid in [
+            r#"[{"msg":"aGVsbG8="},null]"#,
+            r#"{"result":{"msg":"!"}}"#,
+            r#"{"result":{"extra":[]}}"#,
+        ] {
+            assert!(matches!(
+                decode_cipher_box(invalid),
+                Err(WsError::Decode(_))
+            ));
+        }
     }
 
     #[test]
-    fn strip_wrapper_error() {
+    fn typed_wrapper_preserves_server_status() {
         let raw = r#"{"error":{"code":3,"message":"stream not found"}}"#;
-        let err = strip_json_wrapper(raw).unwrap_err();
+        let err = decode_cipher_box(raw).unwrap_err();
         match err {
             WsError::Server(msg) => assert!(msg.contains("stream not found")),
             other => panic!("unexpected error {other:?}"),

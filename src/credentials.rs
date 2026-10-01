@@ -48,13 +48,25 @@ pub trait CredentialStore {
 }
 
 /// Simple in-memory credential store suitable for tests or examples.
-#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+/// Debug output redacts all values; serialized data still contains secrets.
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct InMemoryCredentialStore {
+    /// Optional secret protecting serialized credentials.
     pub password: Option<String>,
+    /// Private mailbox address associated with the pairing.
     pub server_host: Option<String>,
+    /// Secret pairing phrase.
     pub pairing_phrase: Option<String>,
+    /// Secret local Noise scalar encoded as hex.
     pub local_key: Option<String>,
+    /// Remote public Noise identity, retained as private correlation data.
     pub remote_key: Option<String>,
+}
+
+impl std::fmt::Debug for InMemoryCredentialStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("InMemoryCredentialStore([redacted])")
+    }
 }
 
 impl CredentialStore for InMemoryCredentialStore {

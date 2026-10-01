@@ -3,13 +3,17 @@ mod connect;
 #[cfg(feature = "transport-mailbox")]
 mod http2;
 #[cfg(feature = "transport-mailbox")]
+mod options;
+#[cfg(feature = "transport-mailbox")]
 mod state;
+#[cfg(feature = "transport-mailbox")]
+mod stretch;
 
 #[cfg(feature = "transport-mailbox")]
 use self::{
     connect::MailboxConnectContext,
     http2::Http2Channel,
-    state::{parse_auth_metadata, MailboxState},
+    state::{parse_auth_metadata, Http2Driver, MailboxState},
 };
 #[cfg(feature = "transport-mailbox")]
 use crate::{
@@ -57,6 +61,10 @@ pub struct MailboxTransport {
     #[cfg(feature = "transport-mailbox")]
     config: MailboxConfig,
     #[cfg(feature = "transport-mailbox")]
+    resolved_address: Option<std::net::SocketAddr>,
+    #[cfg(feature = "transport-mailbox")]
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+    #[cfg(feature = "transport-mailbox")]
     state: Option<MailboxState>,
 }
 
@@ -68,6 +76,10 @@ impl MailboxTransport {
             last_remote_key: None,
             #[cfg(feature = "transport-mailbox")]
             config: MailboxConfig::default(),
+            #[cfg(feature = "transport-mailbox")]
+            resolved_address: None,
+            #[cfg(feature = "transport-mailbox")]
+            tls_config: None,
             #[cfg(feature = "transport-mailbox")]
             state: None,
         }
@@ -81,6 +93,8 @@ impl MailboxTransport {
             server_host,
             last_remote_key: None,
             config,
+            resolved_address: None,
+            tls_config: None,
             state: None,
         }
     }
@@ -115,6 +129,8 @@ impl MailboxTransport {
             gbn_opts: self.config.gbn.clone(),
             retry_wait: self.config.retry_wait,
             timeouts: WsTimeouts::new(self.config.ws_connect_timeout, self.config.ws_send_timeout),
+            resolved_address: self.resolved_address,
+            tls_config: self.tls_config.clone(),
         };
         let client = timeout(
             self.config.session_timeout,
@@ -149,7 +165,7 @@ impl MailboxTransport {
                 Ok(conn)
             }
             Err(e) => {
-                debug!(target: "lnd_rs::mailbox", error = %e, "noise connect error");
+                debug!(target: "lnd_rs::mailbox", "noise connect error");
                 let hint = Self::status_hint(*status_rx.borrow());
                 if let Some(prefix) = hint {
                     Err(TransportError::connection_message(format!("{prefix}: {e}")))
@@ -165,7 +181,10 @@ impl MailboxTransport {
         &self,
         noise_conn: NoiseConn,
         server_host: &str,
-    ) -> Result<Http2Channel, TransportError> {
+    ) -> Result<(Http2Channel, Http2Driver), TransportError> {
+        let authority = server_host
+            .parse::<http::uri::Authority>()
+            .map_err(|e| TransportError::connection("invalid mailbox authority", e))?;
         debug!(target: "lnd_rs::mailbox", "establishing HTTP/2 connection");
         let io = TokioIo::new(noise_conn);
         let mut builder = hyper_http2::Builder::new(TokioExecutor::new());
@@ -180,21 +199,18 @@ impl MailboxTransport {
                 TransportError::connection_message("HTTP/2 handshake timed out over Noise tunnel")
             })?
             .map_err(|e| TransportError::connection("HTTP/2 handshake failed", e))?;
-        tokio::spawn(async move {
+        let driver = Http2Driver(tokio::spawn(async move {
             trace!(target: "lnd_rs::mailbox::http2", "driver started");
             let res = conn.await;
             match res {
                 Ok(()) => trace!(target: "lnd_rs::mailbox::http2", "driver finished (ok)"),
-                Err(e) => {
-                    debug!(target: "lnd_rs::mailbox::http2", error = %e, "connection error");
+                Err(_) => {
+                    debug!(target: "lnd_rs::mailbox::http2", "connection error");
                 }
             }
-        });
+        }));
         debug!(target: "lnd_rs::mailbox", "HTTP/2 connection established");
-        let authority = server_host
-            .parse::<http::uri::Authority>()
-            .map_err(|e| TransportError::connection("invalid mailbox authority", e))?;
-        Ok(Http2Channel::new(send_request, authority))
+        Ok((Http2Channel::new(send_request, authority), driver))
     }
 
     #[cfg(feature = "transport-mailbox")]
@@ -204,17 +220,6 @@ impl MailboxTransport {
         let metadata_buf = ctx.auth_capture.lock();
         let metadata = parse_auth_metadata(metadata_buf.as_slice());
         drop(metadata_buf);
-        if metadata.is_empty() {
-            debug!(target: "lnd_rs::mailbox", "auth metadata: <none>");
-        } else {
-            for (k, v) in &metadata {
-                if k.eq_ignore_ascii_case("macaroon") {
-                    debug!(target: "lnd_rs::mailbox", macaroon_len = v.len(), "auth metadata: macaroon");
-                } else {
-                    debug!(target: "lnd_rs::mailbox", key = %k, value = %v, "auth metadata");
-                }
-            }
-        }
         let metadata = Arc::from(metadata.into_boxed_slice());
         let remote_key_hex = ctx
             .remote_hint
@@ -266,8 +271,8 @@ impl Transport for MailboxTransport {
 
     /// Establish the mailbox transport and perform Noise + HTTP/2 handshakes.
     ///
-    /// For the XX handshake path (no remote key hint), the passphrase stretching uses a blocking
-    /// task via `tokio::task::spawn_blocking` to avoid stalling the async runtime.
+    /// For the XX handshake path (no remote key hint), passphrase stretching uses
+    /// the bounded process-owned worker rather than the caller runtime's pool.
     async fn connect(
         &mut self,
         server_host: &str,
@@ -293,20 +298,18 @@ impl Transport for MailboxTransport {
             let noise_conn = self
                 .perform_noise_handshake(client.clone(), ctx.builder.build(), status_rx.clone())
                 .await?;
-            let svc = self
+            let (svc, driver) = self
                 .establish_http2_channel(noise_conn, server_host)
                 .await?;
             let (metadata, remote_key_hex) = Self::capture_session_state(&ctx);
 
             self.last_remote_key.clone_from(&remote_key_hex);
-            if let Some(ref rk) = self.last_remote_key {
-                debug!(target: "lnd_rs::mailbox", remote_key = %rk, "remote key captured");
-            }
             self.state = Some(MailboxState {
                 client,
                 svc,
                 metadata,
                 status_rx,
+                _driver: driver,
             });
             Ok(())
         }
@@ -349,3 +352,9 @@ impl Transport for MailboxTransport {
         self.last_remote_key.clone()
     }
 }
+
+#[cfg(all(test, feature = "transport-mailbox"))]
+mod privacy_tests;
+
+#[cfg(all(test, feature = "transport-mailbox"))]
+mod material_tests;

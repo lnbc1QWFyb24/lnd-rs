@@ -20,6 +20,9 @@ use tonic::{
 /// - `local_key` / `remote_key` are the Noise static key material tracked by LNC.
 /// - `macaroon_hex` carries the authentication macaroon captured from the handshake metadata.
 ///
+/// Debug output redacts the entire tuple. Serialization intentionally retains
+/// credentials; callers must protect serialized values and avoid logging them.
+///
 /// # Examples
 ///
 /// ```
@@ -34,7 +37,7 @@ use tonic::{
 /// };
 /// assert!(creds.macaroon_hex.is_some());
 /// ```
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PairingCredentials {
     /// Mailbox host/port that issued the credentials (e.g. `mailbox.terminal.lightning.today:443`).
     pub server_host: String,
@@ -46,6 +49,12 @@ pub struct PairingCredentials {
     pub remote_key: String,
     /// Hex-encoded macaroon captured during Noise authentication, if present.
     pub macaroon_hex: Option<String>,
+}
+
+impl std::fmt::Debug for PairingCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PairingCredentials([redacted])")
+    }
 }
 
 /// Library-level error type surfaced by [`Lnc`].
@@ -109,6 +118,25 @@ impl<T: Transport> Lnc<T> {
     }
 
     /// Construct an [`Lnc`] instance with an explicit [`LncConfig`].
+    ///
+    /// The high-level client uses the server-host fallback. The supplied
+    /// transport owns its configuration: pass mailbox tuning to
+    /// `MailboxTransport::with_mailbox_config` before calling this constructor.
+    /// `namespace` is reserved and is not applied to transport sessions.
+    ///
+    /// ```
+    /// # #[cfg(feature = "transport-mailbox")]
+    /// # {
+    /// use lnd_rs::{config::LncConfig, transport::mailbox::MailboxTransport, Lnc};
+    ///
+    /// let mut config = LncConfig::default();
+    /// config.mailbox.session_timeout = std::time::Duration::from_secs(5);
+    /// let transport = MailboxTransport::with_mailbox_config(
+    ///     config.server_host.clone(), config.mailbox.clone(),
+    /// );
+    /// let _client = Lnc::with_config(transport, config);
+    /// # }
+    /// ```
     pub fn with_config(transport: T, config: LncConfig) -> Self {
         Self {
             transport,
@@ -341,7 +369,8 @@ impl<T: Transport> Lnc<T> {
 
     /// Returns the underlying gRPC service for building custom clients.
     ///
-    /// This is useful when you need clients beyond [`LightningClient`], such as
+    /// This is useful when you need clients beyond
+    /// [`LightningClient`](crate::proto::lnrpc::lightning_client::LightningClient), such as
     /// `WalletKitClient` or `RouterClient`.
     ///
     /// # Example

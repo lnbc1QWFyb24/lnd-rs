@@ -17,11 +17,11 @@
 //!
 //! Example (direct gRPC)
 //! ```no_run
+//! # #[cfg(feature = "transport-direct")]
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! use lnd_rs::transport::direct::DirectGrpc;
 //! use lnd_rs::Lnc;
 //!
-//! # #[tokio::main]
-//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let addr = "https://127.0.0.1:10009".to_string();
 //! let transport = DirectGrpc::new(addr, None, None);
 //! let mut lnc = Lnc::new(transport);
@@ -35,14 +35,17 @@
 //!
 //! Example (mailbox pairing)
 //! ```no_run
+//! # #[cfg(feature = "transport-mailbox")]
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! use lnd_rs::transport::mailbox::MailboxTransport;
 //! use lnd_rs::{config::LncConfig, Lnc};
 //!
-//! # #[tokio::main]
-//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let pairing_phrase = "abandon ability able about above absent absorb abstract absurd abuse";
-//! let transport = MailboxTransport::new(None);
-//! let mut lnc = Lnc::with_config(transport, LncConfig::default());
+//! let config = LncConfig::default();
+//! let transport = MailboxTransport::with_mailbox_config(
+//!     config.server_host.clone(), config.mailbox.clone(),
+//! );
+//! let mut lnc = Lnc::with_config(transport, config);
 //! let creds = lnc.pair_node(pairing_phrase).await?;
 //! println!("Paired with {}", creds.server_host);
 //! lnc.disconnect().await?;
@@ -57,3 +60,6 @@ pub mod proto;
 pub mod transport;
 
 pub use client::{Lnc, LncError, PairingCredentials, Result};
+
+#[cfg(all(test, feature = "transport-mailbox"))]
+mod test_support;

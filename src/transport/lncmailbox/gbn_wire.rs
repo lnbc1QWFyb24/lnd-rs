@@ -71,6 +71,22 @@ impl Frame {
         }
     }
 
+    /// Decode while retaining the incoming allocation through DATA slices.
+    pub(crate) fn decode_shared(raw: &Bytes) -> Result<Frame, GbnError> {
+        if raw.first() == Some(&DATA) {
+            if raw.len() < 4 {
+                return Err(GbnError::FrameTooShort(DATA));
+            }
+            return Ok(Frame::Data {
+                seq: raw[1],
+                final_chunk: raw[2] == TRUE,
+                is_ping: raw[3] == TRUE,
+                payload: raw.slice(4..),
+            });
+        }
+        Self::decode(raw)
+    }
+
     /// Decode a serialized Go-Back-N frame.
     ///
     /// # Errors

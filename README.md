@@ -101,6 +101,12 @@ Notes for mailbox transport
 - Enable feature `transport-mailbox`.
 - Ensure `resources/aezeed_words_english.txt` contains the 2048‑word English list (BIP39/aezeed).
 - See examples `pair_save` and `connect_saved` for a complete save/restore flow.
+- `with_resolved_address` preserves the original TLS/HTTP authority while using
+  a caller-resolved numeric address; `with_tls_config` applies caller-owned
+  certificate policy to both streams and reconnects.
+- Received `ControlMsg::payload` values are `Bytes`; clones and slices share
+  their receive-memory reservation until the last owner drops. See
+  [receive ownership and cancellation](docs/architecture.md#receive-ownership-and-cancellation).
 
 Examples
 - List and run:

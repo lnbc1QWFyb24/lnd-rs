@@ -30,22 +30,26 @@ impl Default for Http2KeepaliveConfig {
 /// Default Lightning Node Connect mailbox host.
 pub const DEFAULT_SERVER_HOST: &str = "mailbox.terminal.lightning.today:443";
 
-/// Global configuration applied to a [`crate::client::Lnc`] instance.
+/// High-level configuration stored by a [`crate::client::Lnc`] instance.
+/// Transport tuning must also be supplied to the selected transport itself.
 #[derive(Clone, Debug, Default)]
 pub struct LncConfig {
     /// Override the default server host used when the credential store is empty.
     pub server_host: Option<String>,
-    /// Optional namespace suffix to scope mailbox sessions.
+    /// Reserved namespace; the high-level client does not apply it to sessions.
     pub namespace: Option<String>,
     #[cfg(feature = "transport-mailbox")]
-    /// Mailbox transport tuning parameters (timeouts, window sizes, etc.).
+    /// Mailbox tuning; explicitly pass this to
+    /// [`crate::transport::mailbox::MailboxTransport::with_mailbox_config`].
     pub mailbox: MailboxConfig,
 }
 
 #[cfg(feature = "transport-mailbox")]
 #[derive(Clone, Debug)]
 pub struct MailboxConfig {
-    /// Timeout applied to the overall connect sequence (WS + Noise + HTTP/2).
+    /// Timeout applied separately to WS/GBN establishment, the Noise handshake,
+    /// and the HTTP/2 handshake. Pairing preparation precedes these stages;
+    /// callers must enforce a deadline for the whole operation.
     pub session_timeout: Duration,
     /// Delay before retrying websocket send/recv loops after an error.
     pub retry_wait: Duration,
