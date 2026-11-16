@@ -123,6 +123,13 @@ struct InFlight {
     attempts: u32,
 }
 
+/// Resend timeout before any RTT sample.
+const INITIAL_RESEND_TIMEOUT: Duration = Duration::from_millis(400);
+
+/// Lower bound of the smoothed RTT, so a burst of instant ACKs cannot drive
+/// the resend timeout to zero.
+const MIN_SMOOTHED_RTT: Duration = Duration::from_millis(50);
+
 struct SendState {
     next_seq: u8,
     inflight: VecDeque<InFlight>,
@@ -150,6 +157,10 @@ struct Inner {
     closed: AtomicBool,
     last_remote: Mutex<Instant>,
     timeout: Mutex<Duration>,
+    /// Smoothed round-trip estimate the resend `timeout` is derived from.
+    /// Kept separately so each update blends RTT samples, never the
+    /// already-multiplied timeout.
+    smoothed_rtt: Mutex<Duration>,
     handshake_complete: AtomicBool,
     ack_counter: AtomicU32,
     send_timeout_ns: AtomicU64,
@@ -170,6 +181,8 @@ impl Inner {
         recv_tx: mpsc::Sender<RecvEvent>,
     ) -> Self {
         let send_timeout = opts.send_timeout_ms.map(Duration::from_millis);
+        // Start from the RTT that yields the initial 400 ms resend timeout.
+        let initial_rtt = INITIAL_RESEND_TIMEOUT / opts.resend_multiplier.max(1);
         let recv_timeout = opts.recv_timeout_ms.map(Duration::from_millis);
         Self {
             receive_budget: None,
@@ -188,7 +201,8 @@ impl Inner {
             window: Notify::new(),
             closed: AtomicBool::new(false),
             last_remote: Mutex::new(Instant::now()),
-            timeout: Mutex::new(Duration::from_millis(400)),
+            timeout: Mutex::new(INITIAL_RESEND_TIMEOUT),
+            smoothed_rtt: Mutex::new(initial_rtt),
             handshake_complete: AtomicBool::new(false),
             ack_counter: AtomicU32::new(0),
             send_timeout_ns: AtomicU64::new(encode_timeout(send_timeout)),
@@ -280,8 +294,13 @@ impl Inner {
         }
     }
 
+    /// Fold an RTT `sample` into the smoothed RTT and derive the resend
+    /// timeout as `smoothed_rtt * resend_multiplier`.
+    ///
+    /// The blend applies to the RTT estimate only. Blending the stored
+    /// timeout instead would re-apply the multiplier on every ACK and grow
+    /// the timeout exponentially, until lost frames are never resent.
     async fn update_rtt(&self, sample: Duration) {
-        let mut timeout = self.timeout.lock().await;
         let raw_blend = f64::from(self.opts.boost_percent);
         let blend = if raw_blend.is_finite() {
             raw_blend.clamp(0.01, 0.99)
@@ -289,17 +308,13 @@ impl Inner {
             0.5
         };
 
-        let updated = timeout.as_secs_f64() * (1.0 - blend) + sample.as_secs_f64() * blend;
-        let min_timeout_secs = 0.05_f64;
-        let safe_secs = if updated.is_finite() {
-            updated.max(min_timeout_secs)
-        } else {
-            min_timeout_secs
-        };
+        let mut smoothed = self.smoothed_rtt.lock().await;
+        let updated = smoothed.as_secs_f64() * (1.0 - blend) + sample.as_secs_f64() * blend;
+        *smoothed = Duration::try_from_secs_f64(updated)
+            .unwrap_or(MIN_SMOOTHED_RTT)
+            .max(MIN_SMOOTHED_RTT);
 
-        let base = Duration::try_from_secs_f64(safe_secs).unwrap_or(Duration::from_millis(50));
-
-        *timeout = base
+        *self.timeout.lock().await = smoothed
             .checked_mul(self.opts.resend_multiplier)
             .unwrap_or(Duration::MAX);
     }
@@ -390,18 +405,26 @@ impl Inner {
         }
     }
 
+    /// Resend every in-flight frame from the sequence a NACK names onward.
+    ///
+    /// A NACK names the sequence the receiver expects; it drops every frame
+    /// it received after that gap, so all later in-flight frames must be
+    /// resent too (go-back-N). An unknown `seq` resends nothing.
     async fn handle_nack(&self, seq: u8) -> Vec<Frame> {
-        let mut frames = Vec::new();
         let mut send = self.send_state.lock().await;
-        for entry in &mut send.inflight {
-            if entry.seq == seq {
-                entry.sent_at = Instant::now();
+        let Some(start) = send.inflight.iter().position(|entry| entry.seq == seq) else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        send.inflight
+            .iter_mut()
+            .skip(start)
+            .map(|entry| {
+                entry.sent_at = now;
                 entry.attempts += 1;
-                frames.push(entry.frame.clone());
-                break;
-            }
-        }
-        frames
+                entry.frame.clone()
+            })
+            .collect()
     }
 
     async fn handle_data(
@@ -1210,6 +1233,62 @@ mod tests {
 
         let timeout = *inner.timeout.lock().await;
         assert_eq!(timeout, Duration::from_millis(300));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resend_timeout_tracks_rtt_without_compounding() {
+        let (outbound, _outbound_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (recv_tx, _recv_rx) = mpsc::channel::<RecvEvent>(1);
+        let inner = Inner::new(GoBackNOptions::default(), outbound, recv_tx);
+
+        // A long session of steady 100 ms round trips must settle at
+        // rtt x resend_multiplier, not grow with every ACK.
+        for _ in 0..1_000 {
+            inner.update_rtt(Duration::from_millis(100)).await;
+        }
+
+        let timeout = *inner.timeout.lock().await;
+        assert_eq!(timeout, Duration::from_millis(500));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nack_resends_every_frame_from_the_missing_one() {
+        let (outbound, _outbound_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (recv_tx, _recv_rx) = mpsc::channel::<RecvEvent>(1);
+        let inner = Inner::new(GoBackNOptions::default(), outbound, recv_tx);
+        {
+            let mut send = inner.send_state.lock().await;
+            for seq in 4..8 {
+                send.inflight.push_back(InFlight {
+                    seq,
+                    frame: Frame::Data {
+                        seq,
+                        final_chunk: true,
+                        is_ping: false,
+                        payload: Bytes::from_static(b"x"),
+                    },
+                    sent_at: Instant::now(),
+                    attempts: 1,
+                });
+            }
+        }
+
+        // The receiver drops everything after a missing frame, so a NACK
+        // for 5 must resend 5, 6 and 7, but not the already-delivered 4.
+        let resent: Vec<u8> = inner
+            .handle_nack(5)
+            .await
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::Data { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resent, vec![5, 6, 7]);
+        assert!(
+            inner.handle_nack(9).await.is_empty(),
+            "unknown seq resends nothing"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

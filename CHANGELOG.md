@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Fix Go-Back-N retransmission stalling long LNC sessions. The resend timeout
+  blended the already-multiplied timeout on every ACK, so it grew
+  exponentially and reached `Duration::MAX` within seconds; lost frames were
+  then never resent, and the keepalive closed the connection when a ping went
+  unanswered. The timeout is now derived from a separately smoothed RTT.
+- Resend every in-flight frame from the sequence a NACK names, not only that
+  frame; the receiver drops all frames after the gap.
+
 ## 0.2.0
 
 - Add caller-resolved addresses and caller-owned TLS policy for both mailbox
